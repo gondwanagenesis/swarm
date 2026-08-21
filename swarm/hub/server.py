@@ -154,6 +154,10 @@ class Hub:
                         from .fleet_power import fleet_power
 
                         self._send_json(fleet_power(hub.registry))
+                    elif path == "/api/verdicts":
+                        self._send_json({"verdicts": hub.registry.list_verdicts()})
+                    elif path == "/api/bindings":
+                        self._send_json({"bindings": hub.registry.list_bindings()})
                     elif path == "/api/bags":
                         self._send_json({"bags": hub.queue.open_bags()})
                     elif path.startswith("/api/bag/"):
@@ -245,7 +249,45 @@ class Hub:
         for bench_data in payload.get("benchmarks") or []:
             bench = from_dict(BenchResult, bench_data)
             self.registry.record_bench(profile.node_id, bench)
+        self._apply_verdicts(profile, payload)
         return profile.node_id
+
+    def _apply_verdicts(self, profile: NodeProfile, payload: Dict[str, Any]) -> None:
+        """Worth-it gate + Tier-0 bindings land on registration (and any
+        re-register after a hotplug). Every verdict is stored with its reason."""
+        from .coverage import device_class
+        from .verdicts import decide_verdict
+
+        bindings = list(payload.get("bindings") or [])
+        for b in bindings:
+            self.registry.record_binding(
+                profile.node_id,
+                str(b.get("device_class") or "unknown:unknown"),
+                b.get("runtime"),
+                float(b.get("confidence") or 0.0),
+                dict(b.get("evidence") or {}),
+            )
+        pilot = payload.get("pilot") or {}
+        pilot_score = pilot.get("score_gflops")
+        covered = {a["device_class"] for a in self.registry.list_adapters() if a.get("gate_run_id")}
+        power = profile.power
+        classes = {b.get("device_class") for b in bindings}
+        for dev in profile.devices or []:
+            dc = device_class(dev.vendor, dev.name)
+            classes.add(dc)
+        for dc in classes:
+            if not dc:
+                continue
+            dc_bindings = [b for b in bindings if b.get("device_class") == dc]
+            verdict, reason = decide_verdict(
+                str(dc),
+                dc_bindings,
+                pilot_score,
+                power.trust.value if power else None,
+                power.watts if power else None,
+                covered,
+            )
+            self.registry.record_verdict(profile.node_id, str(dc), verdict, reason)
 
     def handle_submit(self, payload: Dict[str, Any]) -> str:
         op = str(payload.get("op") or "")

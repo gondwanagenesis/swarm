@@ -22,8 +22,10 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 from ..bench.fallback import run_floor_benchmarks
+from ..bench.pilot import pilot_cpu_fp32
 from ..core.models import BenchResult
 from ..core.serde import to_dict
+from ..probe.discovery import discover_runtimes
 from ..probe.hotplug import HotplugWatcher
 from ..probe.orchestrator import full_probe
 from ..transport.link import LinkProber
@@ -72,6 +74,15 @@ class Agent:
         self.node_id = profile.node_id
         link = LinkProber(self.hub_host, self.hub_port).probe(profile.node_id)
 
+        pilot: Dict[str, Any] = {}
+        bindings: List[Dict[str, Any]] = []
+        try:
+            pilot = pilot_cpu_fp32()
+            bindings, discovery_anomalies = discover_runtimes(profile.devices, capability)
+            profile.anomalies.extend(discovery_anomalies)
+        except Exception:
+            pass
+
         benches: List[BenchResult] = []
         if self.do_bench:
             benches = run_floor_benchmarks()
@@ -81,6 +92,8 @@ class Agent:
             "profile": to_dict(profile),
             "capability": to_dict(capability),
             "benchmarks": [to_dict(b) for b in benches],
+            "pilot": pilot,
+            "bindings": bindings,
         }
         resp = self._post("/api/register", payload)
         if resp and resp.get("ok"):

@@ -8,6 +8,7 @@ the integrator (M4) doesn't; tables are cheap, rewrites are not.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import time
@@ -67,6 +68,23 @@ CREATE TABLE IF NOT EXISTS adapters (
     gate_run_id TEXT,
     exemplar_id TEXT,
     at REAL
+);
+CREATE TABLE IF NOT EXISTS runtime_bindings (
+    node_id TEXT,
+    device_class TEXT,
+    runtime TEXT,
+    confidence REAL,
+    evidence_json TEXT,
+    at REAL,
+    PRIMARY KEY (node_id, device_class, runtime)
+);
+CREATE TABLE IF NOT EXISTS device_verdicts (
+    node_id TEXT,
+    device_class TEXT,
+    verdict TEXT,
+    reason TEXT,
+    at REAL,
+    PRIMARY KEY (node_id, device_class)
 );
 """
 
@@ -242,4 +260,43 @@ class Registry:
     @synchronized
     def list_adapters(self) -> List[Dict[str, Any]]:
         rows = self._conn.execute("SELECT * FROM adapters ORDER BY at DESC").fetchall()
+        return [dict(r) for r in rows]
+
+    @synchronized
+    def record_binding(
+        self,
+        node_id: str,
+        device_class: str,
+        runtime: Optional[str],
+        confidence: float,
+        evidence: Dict[str, Any],
+    ) -> None:
+        self._conn.execute(
+            """INSERT INTO runtime_bindings (node_id, device_class, runtime, confidence, evidence_json, at)
+               VALUES (?,?,?,?,?,?)
+               ON CONFLICT(node_id, device_class, runtime) DO UPDATE SET
+                 confidence=excluded.confidence, evidence_json=excluded.evidence_json, at=excluded.at""",
+            (node_id, device_class, runtime, confidence, json.dumps(evidence, sort_keys=True), time.time()),
+        )
+        self._conn.commit()
+
+    @synchronized
+    def record_verdict(self, node_id: str, device_class: str, verdict: str, reason: str) -> None:
+        self._conn.execute(
+            """INSERT INTO device_verdicts (node_id, device_class, verdict, reason, at)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(node_id, device_class) DO UPDATE SET
+                 verdict=excluded.verdict, reason=excluded.reason, at=excluded.at""",
+            (node_id, device_class, verdict, reason, time.time()),
+        )
+        self._conn.commit()
+
+    @synchronized
+    def list_verdicts(self) -> List[Dict[str, Any]]:
+        rows = self._conn.execute("SELECT * FROM device_verdicts ORDER BY at DESC").fetchall()
+        return [dict(r) for r in rows]
+
+    @synchronized
+    def list_bindings(self) -> List[Dict[str, Any]]:
+        rows = self._conn.execute("SELECT * FROM runtime_bindings ORDER BY at DESC").fetchall()
         return [dict(r) for r in rows]
