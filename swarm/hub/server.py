@@ -19,6 +19,7 @@ import contextlib
 import json
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from ..core.identity import canonical_hash
@@ -65,6 +66,11 @@ class Hub:
             self.registry,
             frontier=self.llm_config,
             local=local_brain_config_from_env(),
+        )
+        from .workshop import Workshop
+
+        self.workshop = Workshop(
+            self.registry._conn, Path(__file__).resolve().parents[2], lock=self.registry._lock
         )
         self.agent_payload: Optional[bytes] = None
         self.started_at = time.time()
@@ -172,6 +178,8 @@ class Hub:
                         self._send_json(fleet_power(hub.registry))
                     elif path == "/api/verdicts":
                         self._send_json({"verdicts": hub.registry.list_verdicts()})
+                    elif path == "/api/workshop":
+                        self._send_json({"patches": hub.workshop.ledger()})
                     elif path == "/api/bindings":
                         self._send_json({"bindings": hub.registry.list_bindings()})
                     elif path == "/invite" or path.startswith("/invite/"):
@@ -305,6 +313,29 @@ class Hub:
                     elif path == "/api/brain/admin":
                         payload = self._read_json()
                         self._send_json(hub.handle_brain_admin(payload))
+                    elif path == "/api/workshop/propose":
+                        payload = self._read_json()
+                        record = hub.workshop.propose(
+                            title=str(payload.get("title") or ""),
+                            reason=str(payload.get("reason") or ""),
+                            files=dict(payload.get("files") or {}),
+                            authored_by=str(payload.get("authored_by") or "human"),
+                        )
+                        self._send_json(record)
+                    elif path == "/api/workshop/apply":
+                        payload = self._read_json()
+                        try:
+                            out = hub.workshop.approve_and_apply(str(payload.get("patch_id") or ""))
+                            self._send_json({"ok": True, **out})
+                        except (KeyError, ValueError) as exc:
+                            self._bad(str(exc))
+                    elif path == "/api/workshop/rollback":
+                        payload = self._read_json()
+                        try:
+                            out = hub.workshop.rollback(str(payload.get("patch_id") or ""))
+                            self._send_json({"ok": True, **out})
+                        except (KeyError, ValueError) as exc:
+                            self._bad(str(exc))
                     elif path == "/api/spore/event":
                         payload = self._read_json()
                         hub.enrollment.log_spore_event(

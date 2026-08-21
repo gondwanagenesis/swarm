@@ -72,6 +72,22 @@ Code that needs an external capability (a tool, a package, a runtime) must:
 - Run checks before committing: `python -m pytest tests/` and
   `python -m compileall swarm` (stdlib-only lint is manual: grep the imports).
 
+## The seventh law: self-modification
+
+The swarm may edit its own source — but ONLY through `swarm.hub.workshop`:
+
+1. Every change is a *proposal*: sandboxed against the full test suite +
+   stdlib-import gate. A red gate means the change never touches the tree.
+2. Human approval is the membrane. Applying requires an explicit operator
+   POST. No silent auto-apply.
+3. Every propose/apply/rollback lands in the patch ledger with content hashes.
+   Rollback restores exact bytes.
+4. Workshop code can never edit outside the repo, never produce binary/git
+   internals, and workshop tests never recurse (sandbox sets
+   SWARM_WORKSHOP_SANDBOX=1).
+
+The organism heals itself the way it earns trust: by proof, not permission.
+
 ## Milestones (build order is sacred)
 
 - **M1 (done):** probe + capability tower + benchmarks + hub registry + link measurement + dashboard.

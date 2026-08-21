@@ -52,6 +52,7 @@ detector, no central brain that must stay alive for cells to keep working.
 | Consent membrane (M4.5) | **Live.** Enrollment tokens + one-click invite page + per-invite bundled agent. Welfare loop — the organism exhales when you're typing or battery's low. |
 | The spore (E+) | **Live.** `--seed` watches interfaces/adb for attachments; zero-click spread onto fleet-token devices; one-click for anything else; growth logged. |
 | The teeth (M5) | **Scaffold.** Measured-memory pipeline planner at `/api/pipeline/plan`; behavioral model runs land with M5 proper. |
+| Gene expression (workshop) | **Live.** The organism edits its own code — but only through law: proposals are sandboxed against the full test suite + stdlib gate, staged, applied only on operator approval, every byte content-hashed in the patch ledger, and rollback restores exact bytes. It writes itself like a careful contractor, not a hallucinating intern. |
 | Collective motion (M6) | **Not yet.** Multi-model packing, adaptive replication. |
 
 ## RSSI of the organism (the fuel gauge)
