@@ -12,6 +12,7 @@ from fighting writers (workers).
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 import threading
 import time
@@ -60,6 +61,23 @@ CREATE TABLE IF NOT EXISTS node_stats (
 );
 """
 
+_MIGRATION_V2 = [
+    "ALTER TABLE tasks ADD COLUMN lease_started_at REAL",
+    "ALTER TABLE tasks ADD COLUMN hedge_count INTEGER DEFAULT 0",
+    "ALTER TABLE tasks ADD COLUMN hedge_by TEXT",
+    "ALTER TABLE tasks ADD COLUMN hedge_expires_at REAL",
+    "ALTER TABLE tasks ADD COLUMN hedge_started_at REAL",
+    "ALTER TABLE node_stats ADD COLUMN completions INTEGER DEFAULT 0",
+    "ALTER TABLE node_stats ADD COLUMN failures INTEGER DEFAULT 0",
+    "ALTER TABLE node_stats ADD COLUMN suspended INTEGER DEFAULT 0",
+]
+
+SCHEMA_VERSION = 2
+
+HEDGE_FRACTION_GATE = 0.75
+HEDGE_ELAPSED_MULTIPLE = 1.5
+SUSPEND_AFTER_FAILURES = 3
+
 DEFAULT_MIN_CHUNK = 2
 DEFAULT_MAX_CHUNK = 512
 BASE_CHUNK = 8
@@ -82,6 +100,12 @@ class WorkQueue:
         self.conn = conn
         self._lock: threading.RLock = lock or threading.RLock()
         self.conn.executescript(_SCHEMA)
+        version = self.conn.execute("PRAGMA user_version").fetchone()[0]
+        if version < SCHEMA_VERSION:
+            for stmt in _MIGRATION_V2:
+                with contextlib.suppress(sqlite3.OperationalError):
+                    self.conn.execute(stmt)
+            self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self.conn.commit()
 
     @synchronized
@@ -107,11 +131,17 @@ class WorkQueue:
     @synchronized
     def sweep_expired(self, now: Optional[float] = None) -> int:
         now = now if now is not None else time.time()
+        expired_nodes = self.conn.execute(
+            "SELECT DISTINCT leased_to FROM tasks WHERE status='leased' AND lease_expires_at < ? AND leased_to IS NOT NULL",
+            (now,),
+        ).fetchall()
         cur = self.conn.execute(
-            """UPDATE tasks SET status='queued', leased_to=NULL, lease_expires_at=NULL, attempts=attempts+1
+            """UPDATE tasks SET status='queued', leased_to=NULL, lease_expires_at=NULL, lease_started_at=NULL, attempts=attempts+1
                WHERE status='leased' AND lease_expires_at < ?""",
             (now,),
         )
+        for row in expired_nodes:
+            self.note_failure(row["leased_to"])
         self.conn.commit()
         return cur.rowcount
 
@@ -136,9 +166,9 @@ class WorkQueue:
                 (n_items,),
             ).fetchall()
             if rows:
-                claim = [(node_id, expires, bag, seq) for bag, seq in rows]
+                claim = [(node_id, expires, now, bag, seq) for bag, seq in rows]
                 self.conn.executemany(
-                    "UPDATE tasks SET status='leased', leased_to=?, lease_expires_at=? WHERE bag_id=? AND seq=? AND status='queued'",
+                    "UPDATE tasks SET status='leased', leased_to=?, lease_expires_at=?, lease_started_at=? WHERE bag_id=? AND seq=? AND status='queued'",
                     claim,
                 )
             self.conn.execute("COMMIT")
@@ -146,7 +176,8 @@ class WorkQueue:
             self.conn.execute("ROLLBACK")
             raise
         if not rows:
-            return []
+            hedges = self.pull_hedges(node_id, limit=max(1, min(n_items, 2)))
+            return hedges
         out: List[Dict[str, Any]] = []
         for bag_id, seq in rows:
             row = self.conn.execute(
@@ -165,6 +196,103 @@ class WorkQueue:
                     }
                 )
         return out
+
+    @synchronized
+    def pull_hedges(self, node_id: str, limit: int = 2) -> List[Dict[str, Any]]:
+        """Speculative re-execution of stragglers: only once >75% of a bag is
+        claimed, only tasks running > 1.5x the bag's median observed item
+        duration, at most one hedge per task. The original lease stays alive;
+        first finisher wins; the loser's duplicate completion is a no-op."""
+        self.sweep_expired()
+        now = time.time()
+        out: List[Dict[str, Any]] = []
+        for bag in self.open_bags():
+            if len(out) >= limit:
+                break
+            total = bag["total"]
+            if total <= 0:
+                continue
+            claimed = total - (bag["queued"] or 0)
+            if claimed / total < HEDGE_FRACTION_GATE:
+                continue
+            med = self.conn.execute(
+                "SELECT duration_s FROM results WHERE bag_id=? ORDER BY duration_s", (bag["bag_id"],)
+            ).fetchall()
+            if not med:
+                continue
+            median_s = med[len(med) // 2]["duration_s"]
+            if median_s <= 0:
+                continue
+            threshold_started = now - (median_s * HEDGE_ELAPSED_MULTIPLE)
+            rows = self.conn.execute(
+                """SELECT bag_id, seq, idem_key, params_json FROM tasks
+                   WHERE bag_id=? AND status='leased' AND hedge_count < 1
+                     AND lease_started_at IS NOT NULL AND lease_started_at < ?
+                     AND leased_to != ?
+                   LIMIT ?""",
+                (bag["bag_id"], threshold_started, node_id, limit - len(out)),
+            ).fetchall()
+            for row in rows:
+                lease = max(30.0, median_s * 3.0 + 30.0)
+                cur = self.conn.execute(
+                    """UPDATE tasks SET hedge_count = hedge_count + 1, hedge_by=?, hedge_started_at=?, hedge_expires_at=?
+                       WHERE bag_id=? AND seq=? AND status='leased' AND hedge_count < 1""",
+                    (node_id, now, now + lease, row["bag_id"], row["seq"]),
+                )
+                if cur.rowcount != 1:
+                    continue
+                out.append(
+                    {
+                        "bag_id": row["bag_id"],
+                        "seq": row["seq"],
+                        "idem_key": row["idem_key"],
+                        "params": _loads(row["params_json"]),
+                        "op": bag["op"],
+                        "lease_expires_at": now + lease,
+                        "hedge": True,
+                    }
+                )
+        self.conn.commit()
+        return out
+
+    @synchronized
+    def note_failure(self, node_id: str) -> None:
+        """Consecutive-expiry rail: 3 strikes and the node is suspended."""
+        self.conn.execute("INSERT OR IGNORE INTO node_stats (node_id) VALUES (?)", (node_id,))
+        self.conn.execute(
+            "UPDATE node_stats SET failures = failures + 1, suspended = CASE WHEN failures + 1 >= ? THEN 1 ELSE suspended END WHERE node_id=?",
+            (SUSPEND_AFTER_FAILURES, node_id),
+        )
+        self.conn.commit()
+
+    @synchronized
+    def is_suspended(self, node_id: str) -> bool:
+        row = self.conn.execute("SELECT suspended FROM node_stats WHERE node_id=?", (node_id,)).fetchone()
+        return bool(row and row["suspended"])
+
+    @synchronized
+    def node_tier(self, node_id: str) -> str:
+        """Core / Elastic / Opportunistic / Suspended — earned from track
+        record, never declared. Working again resets failures; suspension
+        lifts on evidence, not apology."""
+        row = self.conn.execute(
+            "SELECT samples, failures, suspended, ewma_ms_per_item, ewma_var FROM node_stats WHERE node_id=?",
+            (node_id,),
+        ).fetchone()
+        if row is None:
+            return "opportunistic"
+        if row["suspended"]:
+            return "suspended"
+        import math
+
+        cv = (
+            math.sqrt(max(row["ewma_var"], 0.0)) / row["ewma_ms_per_item"] if row["ewma_ms_per_item"] else 1.0
+        )
+        if row["samples"] >= 50 and row["failures"] == 0 and cv < 0.15:
+            return "core"
+        if row["samples"] >= 10 and row["failures"] <= 1:
+            return "elastic"
+        return "opportunistic"
 
     @synchronized
     def complete(
@@ -226,7 +354,7 @@ class WorkQueue:
         ).fetchone()
         if row is None:
             self.conn.execute(
-                "INSERT INTO node_stats (node_id, ewma_ms_per_item, ewma_var, samples) VALUES (?,?,?,1)",
+                "INSERT INTO node_stats (node_id, ewma_ms_per_item, ewma_var, samples, completions) VALUES (?,?,?,1,1)",
                 (node_id, ms, 0.0),
             )
             return
@@ -236,16 +364,29 @@ class WorkQueue:
         new_mean = (1 - EWMA_ALPHA) * mean + EWMA_ALPHA * ms
         new_var = (1 - EWMA_ALPHA) * (var + EWMA_ALPHA * (ms - mean) ** 2)
         self.conn.execute(
-            "UPDATE node_stats SET ewma_ms_per_item=?, ewma_var=?, samples=? WHERE node_id=?",
+            "UPDATE node_stats SET ewma_ms_per_item=?, ewma_var=?, samples=?, completions=completions+1, failures=0 WHERE node_id=?",
             (new_mean, new_var, samples + 1, node_id),
         )
 
     @synchronized
     def node_stats(self, node_id: str) -> Dict[str, Any]:
         row = self.conn.execute(
-            "SELECT ewma_ms_per_item, ewma_var, samples FROM node_stats WHERE node_id=?", (node_id,)
+            "SELECT ewma_ms_per_item, ewma_var, samples, completions, failures, suspended FROM node_stats WHERE node_id=?",
+            (node_id,),
         ).fetchone()
-        return dict(row) if row else {"ewma_ms_per_item": 0.0, "ewma_var": 0.0, "samples": 0}
+        if row:
+            out = dict(row)
+            out["tier"] = self.node_tier(node_id)
+            return out
+        return {
+            "ewma_ms_per_item": 0.0,
+            "ewma_var": 0.0,
+            "samples": 0,
+            "completions": 0,
+            "failures": 0,
+            "suspended": 0,
+            "tier": "opportunistic",
+        }
 
     @synchronized
     def bag_status(self, bag_id: str) -> Optional[Dict[str, Any]]:

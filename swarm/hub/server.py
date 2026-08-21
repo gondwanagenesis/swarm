@@ -128,7 +128,12 @@ class Hub:
                             self.end_headers()
                             self.wfile.write(body)
                     elif path == "/api/nodes":
-                        self._send_json({"nodes": hub.registry.list_nodes()})
+                        nodes = hub.registry.list_nodes()
+                        for n in nodes:
+                            stats = hub.queue.node_stats(n["node_id"])
+                            n["tier"] = stats["tier"]
+                            n["suspended"] = bool(stats["suspended"])
+                        self._send_json({"nodes": nodes})
                     elif path.startswith("/api/nodes/"):
                         node_id = path.rsplit("/", 1)[-1]
                         detail = hub.registry.node_detail(node_id)
@@ -197,8 +202,8 @@ class Hub:
                         self._send_json({"ok": True, "bag_id": bag_id})
                     elif path == "/api/tasks/pull":
                         payload = self._read_json()
-                        items = hub.handle_pull(str(payload.get("node_id", "")))
-                        self._send_json({"ok": True, "tasks": items})
+                        pull = hub.handle_pull(str(payload.get("node_id", "")))
+                        self._send_json({"ok": True, **pull})
                     elif path == "/api/tasks/complete":
                         payload = self._read_json()
                         outcome = hub.queue.complete(
@@ -250,10 +255,12 @@ class Hub:
         idem_keys = [canonical_hash({"op": op, "params": params}) for params in params_list]
         return self.queue.submit_bag(op, params_list, idem_keys)
 
-    def handle_pull(self, node_id: str) -> list:
+    def handle_pull(self, node_id: str) -> Dict[str, Any]:
+        if self.queue.is_suspended(node_id):
+            return {"tasks": [], "suspended": True}
         open_bags = self.queue.open_bags()
         if not open_bags:
-            return []
+            return {"tasks": self.queue.pull_hedges(node_id), "suspended": False}
         status = open_bags[0]
         self.planner.touch_worker(node_id)
         stats = self.queue.node_stats(node_id)
@@ -266,7 +273,7 @@ class Hub:
             active_worker_count=self.planner.active_count(),
         )
         items = self.queue.pull(node_id, chunk, lease, predicted_ms)
-        return items
+        return {"tasks": items, "suspended": False}
 
     def serve_forever(self) -> Tuple[str, int]:
         handler = self.make_handler()
