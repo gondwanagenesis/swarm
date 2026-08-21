@@ -74,18 +74,13 @@ Code that needs an external capability (a tool, a package, a runtime) must:
 
 ## Milestones (build order is sacred)
 
-- **M1 (done):** probe + capability tower + benchmarks + hub registry + link
-  measurement + dashboard.
-- **M2 (done):** pull-based bag-of-tasks, leases + renewal + expiry sweep,
-  confidence-weighted chunks with guided tail shrink, idempotent
-  content-addressed results. Proven: kill-node mid-batch completes exactly once.
-- M3: tail hedging at p90/p95, suspend consistently-failing nodes, node tiers
-  (Core/Elastic/Opportunistic) derived from track record.
-- M4: integrator — Tier 0 discovery, AI adapter synthesis (LLM client config
-  exists; provider-agnostic, armed only by env key), contract gate, trial cells.
-- M4.5 (partial): single-file agent bundle (`/agent.pyz`) + manual enrollment
-  exist; fleet tokens, signed bundles, resource-invisibility control loop remain.
-- M5: pipeline-parallel inference, speculative decoding.
-- M6: multi-model packing, small-model fine-tuning, adaptive replication.
+- **M1 (done):** probe + capability tower + benchmarks + hub registry + link measurement + dashboard.
+- **M2 (done):** pull-based bag-of-tasks, leases + renewal + expiry sweep, confidence-weighted chunks with guided tail shrink, idempotent content-addressed results. Proven: kill-node mid-batch completes exactly once.
+- **M3 (done):** hedging (75%-claimed + 1.5x median elapsed, max 1/task), tiers earned from track record, suspension rail (3 strikes), failure attribution in the sweep.
+- **M4 (done):** Tier-0 discovery first (existing runtimes over new code); pilot sniff; worth-it gate (adopt_now / synthesize / park WITH reasons); contract gate proven on hand-written code first, calibration fields included; LLM synthesis (provider-agnostic; NeuralWatt via env) gated and budget-capped; trial/promotion recorded with provenance hash.
+- **M4.5 (done):** enrollment tokens + one-click invite + per-invite bundled agent; welfare/politeness loop (battery, user-idle); spore/seed posture with attachment watch (interface + adb diff), zero-click on authorized fleet, one-click for strangers. The seed never self-installs.
+- **M5 (scaffold):** pipeline planner that maps stages to measured free memory, fails closed. Behavioral model execution with real adapters lands next — with the idle-honing loop deepening measurements in the background.
+- **M6:** multi-model packing, small-model fine-tuning, adaptive replication.
 
 Do not build M4 features while M2/M3 invariants are untested.
+Do not build M6 features while M5's planner hasn't executed a real model.

@@ -253,6 +253,31 @@ class Hub:
                             list(payload.get("results") or []),
                         )
                         self._send_json({"ok": True, **outcome})
+                    elif path == "/api/pipeline/plan":
+                        payload = self._read_json()
+                        from .pipeline import ModelStage, plan_pipeline
+
+                        stages = [
+                            ModelStage(
+                                name=str(s.get("name") or f"stage-{i}"),
+                                flops=float(s.get("flops") or 0.0),
+                                peak_mem_bytes=int(s.get("peak_mem_bytes") or 0),
+                            )
+                            for i, s in enumerate(payload.get("stages") or [])
+                        ]
+                        plan = plan_pipeline(hub.registry, str(payload.get("model") or "unnamed"), stages)
+                        self._send_json(
+                            {
+                                "model": plan.model_name,
+                                "feasible": plan.feasible,
+                                "reason": plan.reason,
+                                "estimated_end_to_end_ms": plan.estimated_end_to_end_ms,
+                                "assignments": [
+                                    {"stage": a.stage, "node_id": a.node_id, "est_ms": a.est_ms}
+                                    for a in plan.assignments
+                                ],
+                            }
+                        )
                     elif path == "/api/spore/event":
                         payload = self._read_json()
                         hub.enrollment.log_spore_event(

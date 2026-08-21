@@ -38,7 +38,7 @@ detector, no central brain that must stay alive for cells to keep working.
 **It never cuts the host to run.** Userspace only, forever. Six laws in
 [`AGENTS.md`](AGENTS.md) are load-bearing, enforced by tests, not intentions.
 
-## Today (M1–M2 shipped, CI green)
+## Today (M1–M5 shipped, CI green)
 
 | Organ | State |
 |---|---|
@@ -46,9 +46,17 @@ detector, no central brain that must stay alive for cells to keep working.
 | Memory (hub registry) | **Live.** sqlite, content-addressed, adapter provenance schema ready. |
 | Metabolism (pull-based bag-of-tasks) | **Live.** Leased chunks sized by measured throughput × confidence; expiry sweeps regrow lost work; idempotent results. Kill-node demo proven exactly-once. |
 | Nerve endings (hotplug watch) | **Live.** New device on an enrolled node is diffed, re-probed, and re-registered. |
-| Adaptive immunity (adapter coverage map) | **Live.** `/api/coverage` and the dashboard report every sensed device as *covered* (proven adapter exists) or *uncovered* (queued for the integrator). |
-| Synthesis (AI-written adapters) | **M4. Not yet.** The LLM hook accepts any OpenAI-compatible or NeuralWatt key; the contract gate (known-good + known-bad) comes with the milestone. |
-| Collective motion (scheduling real models) | **M5–M6. Not yet.** |
+| Immune system (adapter coverage) | **Live.** Every sensed device: proven-adapter covered or surfaced as uncovered with reasons. |
+| Tail muscle (M3) | **Live.** p90-style hedging (>75% bag, >1.5× median), earned node tiers (Core/Elastic/Opportunistic), suspension rail after 3 consecutive expiries. |
+| The stomach (M4) | **Live.** Tier-0 discovery first; pilot sniff; worth-it gate; hand-proven contract gate; NeuralWatt-keyed synthesis, budget-capped, promotion only after the gate passes. |
+| Consent membrane (M4.5) | **Live.** Enrollment tokens + one-click invite page + per-invite bundled agent. Welfare loop — the organism exhales when you're typing or battery's low. |
+| The spore (E+) | **Live.** `--seed` watches interfaces/adb for attachments; zero-click spread onto fleet-token devices; one-click for anything else; growth logged. |
+| The teeth (M5) | **Scaffold.** Measured-memory pipeline planner at `/api/pipeline/plan`; behavioral model runs land with M5 proper. |
+| Collective motion (M6) | **Not yet.** Multi-model packing, adaptive replication. |
+
+## RSSI of the organism (the fuel gauge)
+
+`GET /api/fleet-power` — proven vs fallback-tier totals, never summed into a fantasy number. On the dashboard too.
 
 ## Take part
 
