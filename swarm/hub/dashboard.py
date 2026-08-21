@@ -11,6 +11,7 @@ import json
 import time
 from typing import List, Optional
 
+from .queue import WorkQueue
 from .registry import Registry
 
 STYLE = """
@@ -65,10 +66,11 @@ def _ago(ts: Optional[float]) -> str:
     return f"{delta / 3600:.1f}h ago"
 
 
-def render_dashboard(registry: Registry) -> str:
+def render_dashboard(registry: Registry, queue: Optional[WorkQueue] = None) -> str:
     nodes = registry.list_nodes()
     links = registry.list_links()
     anomalies = registry.recent_anomalies(20)
+    bags = queue.open_bags() if queue is not None else []
 
     node_rows: List[str] = []
     for node in nodes:
@@ -98,8 +100,7 @@ def render_dashboard(registry: Registry) -> str:
         )
         bench_cells = (
             "<br>".join(
-                f"{html.escape(b['name'])}: {_fmt_bench(b['value'], b['unit'], b['trust'])}"
-                for b in benches
+                f"{html.escape(b['name'])}: {_fmt_bench(b['value'], b['unit'], b['trust'])}" for b in benches
             )
             or '<span class="none">no benchmarks yet</span>'
         )
@@ -115,11 +116,7 @@ def render_dashboard(registry: Registry) -> str:
             f"<td>{floor_txt}</td>"
             f"<td>{bench_cells}</td>"
             f"<td>{_ago(node['last_seen'])}"
-            + (
-                f' <span class="warn">({n_anomalies} anomalies)</span>'
-                if n_anomalies
-                else ""
-            )
+            + (f' <span class="warn">({n_anomalies} anomalies)</span>' if n_anomalies else "")
             + "</td>"
             "</tr>"
         )
@@ -129,11 +126,7 @@ def render_dashboard(registry: Registry) -> str:
         bw = link.get("bandwidth_bps")
         bw_txt = f"{bw / 1e9:.2f} Gb/s" if bw else "&mdash;"
         rtt = link.get("rtt_p50_ms")
-        rtt_txt = (
-            f"{rtt:.2f} ms (p95 {link.get('rtt_p95_ms'):.2f})"
-            if rtt is not None
-            else "&mdash;"
-        )
+        rtt_txt = f"{rtt:.2f} ms (p95 {link.get('rtt_p95_ms'):.2f})" if rtt is not None else "&mdash;"
         direct = link.get("direct")
         if direct == 1:
             direct_txt = "direct"
@@ -163,11 +156,30 @@ def render_dashboard(registry: Registry) -> str:
 <div class="meta">values shown with their trust tier; &mdash; means "we could not measure it"</div>
 <h2>Nodes ({len(nodes)})</h2>
 <table><tr><th>Node</th><th>OS / Arch</th><th>CPU / Free mem</th><th>Devices</th><th>Tower</th><th>Benchmarks</th><th>Seen</th></tr>
-{"".join(node_rows) or '<tr><td colspan="7" class="none">No nodes registered. Start an agent: python -m swarm.agent.daemon --hub http://&lt;this&gt;:8777</td></tr>'}
+{
+        "".join(node_rows)
+        or '<tr><td colspan="7" class="none">No nodes registered. Start an agent: python -m swarm.agent.daemon --hub http://&lt;this&gt;:8777</td></tr>'
+    }
 </table>
 <h2>Links ({len(links)})</h2>
 <table><tr><th>Path</th><th>RTT p50</th><th>Bandwidth</th><th>Topology</th></tr>
 {"".join(link_rows) or '<tr><td colspan="4" class="none">No link measurements yet</td></tr>'}
+</table>
+<h2>Bags ({len(bags)})</h2>
+<table><tr><th>Bag</th><th>Op</th><th>Done</th><th>Queued</th><th>Leased</th><th>Total</th></tr>
+{
+        "".join(
+            '<tr><td class="mono">'
+            + html.escape(b["bag_id"][:12])
+            + '</td><td class="mono">'
+            + html.escape(b["op"])
+            + "</td>"
+            '<td class="mono">' + str(b["done"]) + '</td><td class="mono">' + str(b["queued"]) + "</td>"
+            '<td class="mono">' + str(b["leased"]) + '</td><td class="mono">' + str(b["total"]) + "</td></tr>"
+            for b in bags
+        )
+        or '<tr><td colspan="6" class="none">No open bags. Submit: POST /api/bag/submit</td></tr>'
+    }
 </table>
 <h2>Anomalies</h2>
 <table><tr><th>When</th><th>Node</th><th>Source</th><th>Message</th></tr>

@@ -21,21 +21,24 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Tuple
 
+from ..core.identity import canonical_hash
 from ..core.models import BenchResult, LinkMeasurement, NodeProfile
 from ..core.serde import from_dict
 from .dashboard import render_dashboard
+from .queue import WorkQueue
 from .registry import Registry
+from .scheduler import ChunkPlanner
 
 MAX_BODY = 64 * 1024 * 1024
 
 
 class Hub:
-    def __init__(
-        self, host: str = "127.0.0.1", port: int = 8777, db_path: str = ":memory:"
-    ) -> None:
+    def __init__(self, host: str = "127.0.0.1", port: int = 8777, db_path: str = ":memory:") -> None:
         self.host = host
         self.port = port
         self.registry = Registry(db_path)
+        self.queue = WorkQueue(self.registry._conn, lock=self.registry._lock)
+        self.planner = ChunkPlanner(self.registry)
         self.started_at = time.time()
         self._httpd = None
 
@@ -93,9 +96,7 @@ class Hub:
                         node_id = path.rsplit("/", 1)[-1]
                         detail = hub.registry.node_detail(node_id)
                         if detail is None:
-                            self._send_json(
-                                {"ok": False, "error": "unknown node"}, status=404
-                            )
+                            self._send_json({"ok": False, "error": "unknown node"}, status=404)
                         else:
                             detail["benches"] = hub.registry.latest_benches(node_id)
                             self._send_json(detail)
@@ -103,8 +104,17 @@ class Hub:
                         self._send_json({"links": hub.registry.list_links()})
                     elif path == "/api/anomalies":
                         self._send_json({"anomalies": hub.registry.recent_anomalies()})
+                    elif path == "/api/bags":
+                        self._send_json({"bags": hub.queue.open_bags()})
+                    elif path.startswith("/api/bag/"):
+                        bag_id = path.rsplit("/", 1)[-1]
+                        status = hub.queue.bag_status(bag_id)
+                        if status is None:
+                            self._send_json({"ok": False, "error": "unknown bag"}, status=404)
+                        else:
+                            self._send_json(status)
                     elif path in ("/", "/index.html"):
-                        self._send_html(render_dashboard(hub.registry))
+                        self._send_html(render_dashboard(hub.registry, hub.queue))
                     else:
                         self._send_json({"ok": False, "error": "not found"}, status=404)
                 except BrokenPipeError:
@@ -136,6 +146,30 @@ class Hub:
                         link = from_dict(LinkMeasurement, payload)
                         hub.registry.record_link(link)
                         self._send_json({"ok": True})
+                    elif path == "/api/bag/submit":
+                        payload = self._read_json()
+                        bag_id = hub.handle_submit(payload)
+                        self._send_json({"ok": True, "bag_id": bag_id})
+                    elif path == "/api/tasks/pull":
+                        payload = self._read_json()
+                        items = hub.handle_pull(str(payload.get("node_id", "")))
+                        self._send_json({"ok": True, "tasks": items})
+                    elif path == "/api/tasks/complete":
+                        payload = self._read_json()
+                        outcome = hub.queue.complete(
+                            str(payload.get("node_id", "")),
+                            list(payload.get("results") or []),
+                        )
+                        self._send_json({"ok": True, **outcome})
+                    elif path == "/api/tasks/renew":
+                        payload = self._read_json()
+                        renewed = hub.queue.renew(
+                            str(payload.get("node_id", "")),
+                            str(payload.get("bag_id", "")),
+                            [int(s) for s in (payload.get("seqs") or [])],
+                            float(payload.get("lease_seconds") or 60.0),
+                        )
+                        self._send_json({"ok": True, "renewed": renewed})
                     else:
                         self._send_json({"ok": False, "error": "not found"}, status=404)
                 except ValueError as exc:
@@ -162,6 +196,32 @@ class Hub:
             bench = from_dict(BenchResult, bench_data)
             self.registry.record_bench(profile.node_id, bench)
         return profile.node_id
+
+    def handle_submit(self, payload: Dict[str, Any]) -> str:
+        op = str(payload.get("op") or "")
+        params_list = payload.get("params_list") or []
+        if not op or not isinstance(params_list, list) or not params_list:
+            raise ValueError("submit requires op and non-empty params_list")
+        idem_keys = [canonical_hash({"op": op, "params": params}) for params in params_list]
+        return self.queue.submit_bag(op, params_list, idem_keys)
+
+    def handle_pull(self, node_id: str) -> list:
+        open_bags = self.queue.open_bags()
+        if not open_bags:
+            return []
+        status = open_bags[0]
+        self.planner.touch_worker(node_id)
+        stats = self.queue.node_stats(node_id)
+        chunk, lease, predicted_ms = self.planner.plan(
+            node_id=node_id,
+            op=status["op"],
+            bag_total=status["total"],
+            bag_remaining=status["queued"],
+            queue_stats=stats,
+            active_worker_count=self.planner.active_count(),
+        )
+        items = self.queue.pull(node_id, chunk, lease, predicted_ms)
+        return items
 
     def serve_forever(self) -> Tuple[str, int]:
         handler = self.make_handler()
@@ -191,9 +251,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Swarm hub")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8777)
-    parser.add_argument(
-        "--db", default=":memory:", help="sqlite path (default in-memory)"
-    )
+    parser.add_argument("--db", default=":memory:", help="sqlite path (default in-memory)")
     args = parser.parse_args()
     hub = Hub(host=args.host, port=args.port, db_path=args.db)
     print(f"swarm hub listening on http://{args.host}:{args.port} (dashboard at /)")

@@ -9,11 +9,13 @@ the integrator (M4) doesn't; tables are cheap, rewrites are not.
 from __future__ import annotations
 
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from ..core.models import BenchResult, LinkMeasurement, NodeProfile
+from ._sync import synchronized
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS nodes (
@@ -72,14 +74,19 @@ CREATE TABLE IF NOT EXISTS adapters (
 class Registry:
     def __init__(self, db_path: Union[str, Path] = ":memory:") -> None:
         self.db_path = str(db_path)
+        self._lock = threading.RLock()
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        if self.db_path != ":memory:":
+            self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=30000")
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
 
     def close(self) -> None:
         self._conn.close()
 
+    @synchronized
     def upsert_node(
         self,
         profile: NodeProfile,
@@ -88,9 +95,7 @@ class Registry:
         capability_json: str,
     ) -> None:
         now = time.time()
-        cur = self._conn.execute(
-            "SELECT registered_at FROM nodes WHERE node_id = ?", (profile.node_id,)
-        )
+        cur = self._conn.execute("SELECT registered_at FROM nodes WHERE node_id = ?", (profile.node_id,))
         row = cur.fetchone()
         registered_at = row["registered_at"] if row else now
         self._conn.execute(
@@ -124,13 +129,13 @@ class Registry:
             )
         self._conn.commit()
 
+    @synchronized
     def heartbeat(self, node_id: str) -> bool:
-        cur = self._conn.execute(
-            "UPDATE nodes SET last_seen = ? WHERE node_id = ?", (time.time(), node_id)
-        )
+        cur = self._conn.execute("UPDATE nodes SET last_seen = ? WHERE node_id = ?", (time.time(), node_id))
         self._conn.commit()
         return cur.rowcount > 0
 
+    @synchronized
     def record_bench(self, node_id: str, bench: BenchResult) -> None:
         self._conn.execute(
             """INSERT OR REPLACE INTO bench_runs
@@ -151,6 +156,7 @@ class Registry:
         )
         self._conn.commit()
 
+    @synchronized
     def record_link(self, link: LinkMeasurement) -> None:
         self._conn.execute(
             """INSERT INTO links (src_node, dst_node, rtt_p50_ms, rtt_p95_ms, bandwidth_bps, direct, trust, at)
@@ -172,6 +178,7 @@ class Registry:
         )
         self._conn.commit()
 
+    @synchronized
     def record_adapter(
         self,
         adapter_id: str,
@@ -197,20 +204,21 @@ class Registry:
         )
         self._conn.commit()
 
+    @synchronized
     def list_nodes(self) -> List[Dict[str, Any]]:
         rows = self._conn.execute(
             "SELECT node_id, hostname, os, arch, registered_at, last_seen FROM nodes ORDER BY hostname"
         ).fetchall()
         return [dict(r) for r in rows]
 
+    @synchronized
     def node_detail(self, node_id: str) -> Optional[Dict[str, Any]]:
-        row = self._conn.execute(
-            "SELECT * FROM nodes WHERE node_id = ?", (node_id,)
-        ).fetchone()
+        row = self._conn.execute("SELECT * FROM nodes WHERE node_id = ?", (node_id,)).fetchone()
         if not row:
             return None
         return dict(row)
 
+    @synchronized
     def latest_benches(self, node_id: str) -> List[Dict[str, Any]]:
         rows = self._conn.execute(
             """SELECT b.* FROM bench_runs b
@@ -221,18 +229,17 @@ class Registry:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    @synchronized
     def list_links(self) -> List[Dict[str, Any]]:
-        rows = self._conn.execute(
-            "SELECT * FROM links ORDER BY src_node, dst_node"
-        ).fetchall()
+        rows = self._conn.execute("SELECT * FROM links ORDER BY src_node, dst_node").fetchall()
         return [dict(r) for r in rows]
 
+    @synchronized
     def recent_anomalies(self, limit: int = 50) -> List[Dict[str, Any]]:
-        rows = self._conn.execute(
-            "SELECT * FROM anomalies ORDER BY at DESC LIMIT ?", (limit,)
-        ).fetchall()
+        rows = self._conn.execute("SELECT * FROM anomalies ORDER BY at DESC LIMIT ?", (limit,)).fetchall()
         return [dict(r) for r in rows]
 
+    @synchronized
     def list_adapters(self) -> List[Dict[str, Any]]:
         rows = self._conn.execute("SELECT * FROM adapters ORDER BY at DESC").fetchall()
         return [dict(r) for r in rows]

@@ -10,12 +10,16 @@ how much you should trust them.
 
 ## Status
 
-**M1** — discovery and registry. The probe runs on bare Python 3.9+ with zero
-dependencies, discovers its own tooling on a capability tower, benchmarks the node
-with the best instrument it can find (down to pure-stdlib fallbacks), and registers
-everything — including what it *couldn't* measure — with a hub.
+**M1 — discovery and registry + M2 — pull-based bag-of-tasks.** The probe runs
+on bare Python 3.9+ with zero dependencies, discovers its own tooling on a
+capability tower, benchmarks the node with the best instrument it can find
+(down to pure-stdlib fallbacks), and registers everything — including what it
+*couldn't* measure — with a hub. Workers pull leased chunks sized to their
+**measured throughput × confidence**; expired leases requeue automatically;
+results are content-addressed and deduplicated; a node dying mid-batch is a
+non-event (proven in `scripts/demo_m2.py`).
 
-Not yet: scheduling (M2), reliability tiers (M3), AI adapter synthesis (M4).
+Not yet: hedging and reliability tiers (M3), AI adapter synthesis (M4).
 
 ## The capability tower
 
@@ -51,6 +55,23 @@ One-command demo (hub + agent on localhost, full probe + benchmarks):
 ```sh
 python scripts/demo.py
 ```
+
+M2 kill-node demo (3 workers drain a primesum bag; one is killed mid-run;
+its leases expire, the sweep requeues, the bag still completes exactly once):
+
+```sh
+python scripts/demo_m2.py
+```
+
+Submit your own bag against a running hub:
+
+```sh
+curl -X POST http://127.0.0.1:8777/api/bag/submit \
+  -H 'Content-Type: application/json' \
+  -d '{"op": "hashwork", "params_list": [{"seed": "a", "rounds": 20000}, {"seed": "b", "rounds": 20000}]}'
+```
+
+Available ops: `primesum` (`{"n": int}`) and `hashwork` (`{"seed", "rounds"}`).
 
 ## Layout
 

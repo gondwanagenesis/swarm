@@ -13,7 +13,7 @@ import platform
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..core.identity import get_node_id, machine_hostname
 from ..core.models import AgentCapability, Anomaly, NodeProfile
@@ -32,9 +32,7 @@ class ProbeContext:
     finished_at: float = 0.0
 
 
-def _run_timed(
-    name: str, fn: Callable[[], Any], timeout: float, ctx: ProbeContext
-) -> Any:
+def _run_timed(name: str, fn: Callable[[], Any], timeout: float, ctx: ProbeContext) -> Any:
     result: Dict[str, Any] = {}
 
     def target() -> None:
@@ -50,11 +48,7 @@ def _run_timed(
     thread.join(timeout)
     ctx.collector_durations[name] = round(time.perf_counter() - t0, 3)
     if thread.is_alive():
-        ctx.anomalies.append(
-            Anomaly(
-                f"probe.{name}", f"collector hung past {timeout}s; skipped", "error"
-            )
-        )
+        ctx.anomalies.append(Anomaly(f"probe.{name}", f"collector hung past {timeout}s; skipped", "error"))
         ctx.collectors_missed.append(name)
         return None
     ctx.collectors_ran.append(name)
@@ -63,6 +57,7 @@ def _run_timed(
 
 def full_probe(
     timeout: float = 60.0,
+    node_id: Optional[str] = None,
 ) -> Tuple[NodeProfile, AgentCapability, ProbeContext]:
     ctx = ProbeContext(started_at=time.time())
     total_deadline = ctx.started_at + timeout
@@ -71,7 +66,7 @@ def full_probe(
         return max(1.0, min(COLLECTOR_TIMEOUT, total_deadline - time.time()))
 
     profile = NodeProfile(
-        node_id=get_node_id(),
+        node_id=node_id or get_node_id(),
         hostname=machine_hostname(),
         os=platform.system().lower(),
         arch=platform.machine().lower(),
