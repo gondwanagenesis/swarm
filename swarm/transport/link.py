@@ -22,7 +22,7 @@ def _percentile(samples: List[float], pct: float) -> Optional[float]:
     if not samples:
         return None
     ordered = sorted(samples)
-    k = max(0, min(len(ordered) - 1, int(round((pct / 100.0) * (len(ordered) - 1)))))
+    k = max(0, min(len(ordered) - 1, round((pct / 100.0) * (len(ordered) - 1))))
     return ordered[k]
 
 
@@ -36,14 +36,7 @@ def _is_mesh_or_lan(host: str) -> Optional[bool]:
         return None
     if a == 100 and 64 <= b < 128:
         return True
-    if (
-        host in ("127.0.0.1", "localhost")
-        or a == 10
-        or (a == 172 and 16 <= b < 32)
-        or (a == 192 and b == 168)
-    ):
-        return True
-    return False
+    return bool(host in ("127.0.0.1", "localhost") or a == 10 or (a == 172 and 16 <= b < 32) or (a == 192 and b == 168))
 
 
 class LinkProber:

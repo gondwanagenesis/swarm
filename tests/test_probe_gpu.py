@@ -1,7 +1,7 @@
 import platform
 
-from swarm.probe import gpu as gpu_mod
 from swarm.core.models import DeviceInfo
+from swarm.probe import gpu as gpu_mod
 
 
 def _nv(primary=True):

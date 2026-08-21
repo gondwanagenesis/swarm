@@ -2,7 +2,6 @@ import platform
 
 from swarm.probe import cpu as cpu_mod
 
-
 FAKE_CPUINFO = """processor   : 0
 model name  : TestChip 3000
 cpu cores   : 4

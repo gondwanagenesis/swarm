@@ -1,7 +1,7 @@
 import importlib
 
-from swarm.probe import self_probe
 from swarm.core.models import AgentCapability
+from swarm.probe import self_probe
 
 
 def test_floor_zero_when_nothing_exists(monkeypatch):

@@ -8,6 +8,7 @@ path; ctypes is the floor.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import platform
 import re
@@ -43,10 +44,8 @@ def _linux_cgroup_cpu_quota() -> Optional[float]:
     if v2:
         parts = v2.split()
         if len(parts) >= 2 and parts[0] != "max":
-            try:
+            with contextlib.suppress(ValueError):
                 quota_us, period_us = int(parts[0]), int(parts[1])
-            except ValueError:
-                pass
     if quota_us is None:
         quota_us = _read_int("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
         period_us = _read_int("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
@@ -73,10 +72,8 @@ def _linux_cpu(info: CpuInfo, anomalies: List[Anomaly]) -> None:
             info.model = models[0].strip()
         cores = re.findall(r"^cpu cores\s*:\s*(\d+)$", cpuinfo, re.M)
         if cores:
-            try:
+            with contextlib.suppress(ValueError):
                 info.physical_cores = int(cores[0])
-            except ValueError:
-                pass
         mhz = []
         for raw in re.findall(r"^cpu MHz\s*:\s*([\d.]+)$", cpuinfo, re.M):
             try:
@@ -110,14 +107,10 @@ def _macos_cpu(info: CpuInfo, anomalies: List[Anomaly]) -> None:
     ncpu = run_bounded(["sysctl", "-n", "hw.ncpu"], timeout=10.0)
     pcpu = run_bounded(["sysctl", "-n", "hw.physicalcpu"], timeout=10.0)
     freq = run_bounded(["sysctl", "-n", "hw.cpufrequency_max"], timeout=10.0)
-    try:
+    with contextlib.suppress(ValueError, AttributeError):
         info.physical_cores = int(pcpu.strip()) if pcpu else None
-    except (ValueError, AttributeError):
-        pass
-    try:
+    with contextlib.suppress(ValueError, AttributeError):
         info.max_freq_hz = float(freq.strip()) if freq else None
-    except (ValueError, AttributeError):
-        pass
     if platform.machine() == "arm64":
         info.heterogeneous = True
     _ = ncpu
@@ -222,10 +215,8 @@ def _linux_memory(info: MemoryInfo) -> None:
 def _macos_memory(info: MemoryInfo) -> None:
     out = run_bounded(["sysctl", "-n", "hw.memsize"], timeout=10.0)
     if out:
-        try:
+        with contextlib.suppress(ValueError):
             info.total_bytes = int(out.strip())
-        except ValueError:
-            pass
     vm = run_bounded(["vm_stat"], timeout=10.0)
     page_kb = run_bounded(["sysctl", "-n", "vm.pagesize"], timeout=10.0)
     if vm and page_kb:

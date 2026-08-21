@@ -21,7 +21,7 @@ import statistics
 import subprocess
 import sys
 import time
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from ..core.models import AgentCapability, Anomaly
 

@@ -1,6 +1,5 @@
 import http.client
 import json
-import time
 import urllib.request
 
 from swarm.core.models import (

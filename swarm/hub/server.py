@@ -15,13 +15,14 @@ GET  /               dashboard
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Tuple, Union
+from typing import Any, Dict, Tuple
 
 from ..core.models import BenchResult, LinkMeasurement, NodeProfile
-from ..core.serde import from_dict, to_dict
+from ..core.serde import from_dict
 from .dashboard import render_dashboard
 from .registry import Registry
 
@@ -44,7 +45,7 @@ class Hub:
         class Handler(BaseHTTPRequestHandler):
             server_version = "SwarmHub/0.1"
 
-            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+            def log_message(self, format: str, *args: Any) -> None:
                 return
 
             def _send_json(self, obj: Any, status: int = 200) -> None:
@@ -81,7 +82,7 @@ class Hub:
             def _bad(self, msg: str) -> None:
                 self._send_json({"ok": False, "error": msg}, status=400)
 
-            def do_GET(self) -> None:  # noqa: N802
+            def do_GET(self) -> None:
                 try:
                     path = self.path.split("?", 1)[0]
                     if path == "/api/ping":
@@ -109,12 +110,10 @@ class Hub:
                 except BrokenPipeError:
                     pass
                 except Exception as exc:
-                    try:
+                    with contextlib.suppress(Exception):
                         self._send_json({"ok": False, "error": str(exc)}, status=500)
-                    except Exception:
-                        pass
 
-            def do_POST(self) -> None:  # noqa: N802
+            def do_POST(self) -> None:
                 try:
                     path = self.path.split("?", 1)[0]
                     if path == "/api/echo":
@@ -144,10 +143,8 @@ class Hub:
                 except BrokenPipeError:
                     pass
                 except Exception as exc:
-                    try:
+                    with contextlib.suppress(Exception):
                         self._send_json({"ok": False, "error": str(exc)}, status=500)
-                    except Exception:
-                        pass
 
         return Handler
 

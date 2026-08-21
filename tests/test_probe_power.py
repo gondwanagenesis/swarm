@@ -1,5 +1,5 @@
-from swarm.probe import power as power_mod
 from swarm.core.models import PowerTrust
+from swarm.probe import power as power_mod
 
 
 def test_rapl_wrap_modulo_realistic_range():

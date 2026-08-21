@@ -17,7 +17,7 @@ import http.client
 import json
 import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 from ..bench.fallback import run_floor_benchmarks
@@ -93,7 +93,7 @@ class Agent:
                 self.do_bench
                 and (time.time() - self.last_bench_at) > self.rebench_interval
             ):
-                benches = run_floor_benchmarks()
+                run_floor_benchmarks()
                 self.last_bench_at = time.time()
                 self._post("/api/heartbeat", {"node_id": self.node_id})
             time.sleep(HEARTBEAT_SECONDS)

@@ -15,7 +15,7 @@ from __future__ import annotations
 import statistics
 import time
 import uuid
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 from ..core.models import Anomaly, BenchResult, MeasurementTrust
 
@@ -159,7 +159,7 @@ def memory_latency(
         jump = 4099
         chain = [(i + jump) % slots for i in range(slots)]
         idx = 0
-        for i in range(0, slots, jump):
+        for _i in range(0, slots, jump):
             idx = chain[idx]
         idx = 0
         t0 = time.perf_counter()

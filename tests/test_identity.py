@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from swarm.core.identity import adapter_id, result_hash, get_node_id
+from swarm.core.identity import adapter_id, get_node_id, result_hash
 
 
 def test_node_id_persists(tmp_path: Path):

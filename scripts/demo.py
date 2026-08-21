@@ -21,9 +21,7 @@ from swarm.hub.server import Hub
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--hold", type=float, default=20.0, help="seconds to keep dashboard up"
-    )
+    parser.add_argument("--hold", type=float, default=20.0, help="seconds to keep dashboard up")
     args = parser.parse_args()
 
     hub = Hub(port=0)
@@ -59,17 +57,11 @@ def main() -> int:
     print("[bench]")
     for b in benches:
         val = "   n/a   " if b["value"] is None else f"{b['value']:8.3f}"
-        print(
-            f"        {val} {b['unit']:<7} trust={b['trust']:<10} run={b['run_id'][:12]}"
-        )
+        print(f"        {val} {b['unit']:<7} trust={b['trust']:<10} run={b['run_id'][:12]}")
     print("[link]")
-    for l in links:
-        rtt = "  n/a " if l["rtt_p50_ms"] is None else f"{l['rtt_p50_ms']:6.2f}"
-        bw = (
-            "n/a"
-            if l["bandwidth_bps"] is None
-            else f"{l['bandwidth_bps'] / 1e9:.2f} Gb/s"
-        )
+    for link in links:
+        rtt = "  n/a " if link["rtt_p50_ms"] is None else f"{link['rtt_p50_ms']:6.2f}"
+        bw = "n/a" if link["bandwidth_bps"] is None else f"{link['bandwidth_bps'] / 1e9:.2f} Gb/s"
         print(f"        RTT p50: {rtt} ms | bandwidth: {bw}")
     anomalies = hub.registry.recent_anomalies(10)
     if anomalies:

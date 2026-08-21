@@ -36,14 +36,14 @@ def test_agent_registers_with_hub():
         agent = Agent(hub_url=f"http://{host}:{port}", bench=False)
         ok = agent.run_once()
         assert ok
-        nodes = json.loads(
-            urllib.request.urlopen(f"http://{host}:{port}/api/nodes", timeout=10).read()
-        )["nodes"]
+        nodes = json.loads(urllib.request.urlopen(f"http://{host}:{port}/api/nodes", timeout=10).read())[
+            "nodes"
+        ]
         assert any(n["node_id"] == agent.node_id for n in nodes)
-        links = json.loads(
-            urllib.request.urlopen(f"http://{host}:{port}/api/links", timeout=10).read()
-        )["links"]
-        assert any(l["src_node"] == agent.node_id for l in links)
+        links = json.loads(urllib.request.urlopen(f"http://{host}:{port}/api/links", timeout=10).read())[
+            "links"
+        ]
+        assert any(link["src_node"] == agent.node_id for link in links)
     finally:
         hub.stop()
 

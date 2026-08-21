@@ -8,6 +8,7 @@ file was clearly produced under a different hostname).
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import platform
@@ -59,10 +60,8 @@ def get_node_id(state_file: Optional[Path] = None) -> str:
     except Exception:
         pass
     node_id = str(uuid.uuid4())
-    try:
+    with contextlib.suppress(Exception):
         path.write_text(node_id + "\n" + hostname + "\n", encoding="utf-8")
-    except Exception:
-        pass
     return node_id
 
 

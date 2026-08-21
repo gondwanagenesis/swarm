@@ -8,14 +8,12 @@ the integrator (M4) doesn't; tables are cheap, rewrites are not.
 
 from __future__ import annotations
 
-import json
 import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from ..core.models import BenchResult, LinkMeasurement, NodeProfile
-from ..core.serde import to_dict
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS nodes (
