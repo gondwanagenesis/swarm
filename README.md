@@ -81,16 +81,40 @@ Demos: `python scripts/demo.py` (one node, full loop) · `python scripts/demo_m2
 (three workers, one killed mid-bag, exactly-once completion) ·
 `python scripts/demo_hotplug.py` (plug and watch it notice).
 
-## Optional AI arming (M4 groundwork)
+## The brain — three lanes, one kill switch
+
+**Default: a free, abliterated, dense 27B — no API bill, no refusals, runs on
+your tissue.** The currently recommended model
+(mid-2026, per r/LocalLLaMA + huihui-ai tracking):
+[`huihui-ai/Huihui-Qwen3.6-27B-abliterated`](https://huggingface.co/huihui-ai/Huihui-Qwen3.6-27B-abliterated)
+— dense (not MoE), strong reasoning, lowest measured refusal and KLD drift in
+the current crop. Too much GPU? Drop to `huihui-ai/Huihui-Qwen3-14B-abliterated`
+(~9 GB at Q4) or `dolphin3:8b` (~5 GB, any 8 GB card). Serve any of them with
+Ollama or llama.cpp — the swarm only needs an OpenAI-compatible socket.
+
+**Lane 2: frontier API** (NeuralWatt — or any OpenAI-compatible endpoint) for
+the hardest problems. It's **off by default**, admin-toggleable at runtime,
+kill-switchable instantly, rate-limited by budget caps, and *every routing
+decision is logged* with its lane and its reason. A turn-offable dial, not a
+hidden degree of freedom.
 
 ```sh
-set SWARM_NEURALWATT_API_KEY=...   # NeuralWatt
-# or any OpenAI-compatible endpoint:
-set SWARM_LLM_API_KEY=... ; set SWARM_LLM_BASE_URL=... ; set SWARM_LLM_MODEL=...
+# the heart (local, free):
+set SWARM_LOCAL_BRAIN_URL=http://127.0.0.1:11434/v1
+set SWARM_LOCAL_BRAIN_MODEL=huihui-ai/Huihui-Qwen3.6-27B-abliterated
+
+# frontier lane (optional):
+set SWARM_NEURALWATT_API_KEY=...
+
+# admin control plane (runtime, no restart):
+POST /api/brain/admin {"action":"enable"}            # arm frontier lane
+POST /api/brain/admin {"action":"kill_on"}           # instantly sever it
+POST /api/brain/admin {"action":"sensitivity","value":0.85}
+GET  /api/brain                                      # status + last 100 route decisions
 ```
 
-No key → no network calls, organism fully functional. Status (key masked):
-`GET /api/config`.
+Sensitivity tunes how *hard* a task must look before escalating past the
+local brain. No frontier key, and it's absent from the path entirely.
 
 ## Docs
 

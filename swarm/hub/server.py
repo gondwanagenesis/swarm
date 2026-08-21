@@ -59,6 +59,13 @@ class Hub:
         self.enrollment = Enrollment(self.registry._conn, lock=self.registry._lock)
         self.planner = ChunkPlanner(self.registry)
         self.llm_config = llm_from_env()
+        from ..integrator.policy import BrainRouter, local_brain_config_from_env
+
+        self.brain = BrainRouter(
+            self.registry,
+            frontier=self.llm_config,
+            local=local_brain_config_from_env(),
+        )
         self.agent_payload: Optional[bytes] = None
         self.started_at = time.time()
         self._httpd = None
@@ -196,6 +203,8 @@ class Hub:
                         self._send_json({"events": hub.enrollment.spore_events()})
                     elif path == "/api/tokens":
                         self._send_json({"tokens": hub.enrollment.list_tokens()})
+                    elif path == "/api/brain":
+                        self._send_json(hub.brain_status())
                     elif path == "/api/bags":
                         self._send_json({"bags": hub.queue.open_bags()})
                     elif path.startswith("/api/bag/"):
@@ -278,6 +287,9 @@ class Hub:
                                 ],
                             }
                         )
+                    elif path == "/api/brain/admin":
+                        payload = self._read_json()
+                        self._send_json(hub.handle_brain_admin(payload))
                     elif path == "/api/spore/event":
                         payload = self._read_json()
                         hub.enrollment.log_spore_event(
@@ -300,12 +312,27 @@ class Hub:
                         contract_name = str(payload.get("contract") or "prime_contract.json")
                         try:
                             from ..integrator.gate import load_contract
-                            from ..integrator.llm import LlmClient
                             from ..integrator.synthesize import SynthesisLoop
 
                             contract = load_contract(contract_name)
-                            loop = SynthesisLoop(hub.registry, LlmClient(hub.llm_config), contract)
+                            try:
+                                difficulty = float(payload.get("difficulty", 0.9))
+                            except (TypeError, ValueError):
+                                difficulty = 0.9
+                            route = hub.brain.route(difficulty)
+                            client = hub.brain.client_for(route["lane"])
+                            if client is None:
+                                self._send_json(
+                                    {
+                                        "ok": False,
+                                        "reason": f"lane {route['lane_name']} unarmed",
+                                        "route": route,
+                                    }
+                                )
+                                return
+                            loop = SynthesisLoop(hub.registry, client, contract)
                             out = loop.run()
+                            out["route"] = route
                             self._send_json({"ok": bool(out.get("passed")), **out})
                         except FileNotFoundError:
                             self._bad(f"unknown contract {contract_name}")
@@ -421,6 +448,42 @@ a.btn{{display:inline-block;background:#3cc492;color:#0f1215;padding:12px 24px;b
         )
         items = self.queue.pull(node_id, chunk, lease, predicted_ms)
         return {"tasks": items, "suspended": False}
+
+    def brain_status(self) -> Dict[str, Any]:
+        status = self.brain.status()
+        rows = (
+            self.registry._conn.execute(
+                "SELECT lane_name, difficulty, at FROM brain_routes ORDER BY at DESC LIMIT 100"
+            ).fetchall()
+            if self._table_exists("brain_routes")
+            else []
+        )
+        status["recent_routes"] = [dict(r) for r in rows]
+        return status
+
+    def _table_exists(self, name: str) -> bool:
+        return (
+            self.registry._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,)
+            ).fetchone()
+            is not None
+        )
+
+    def handle_brain_admin(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        action = str(payload.get("action") or "")
+        if action == "enable":
+            self.brain.set_enabled(True)
+        elif action == "disable":
+            self.brain.set_enabled(False)
+        elif action == "kill_on":
+            self.brain.set_kill_switch(True)
+        elif action == "kill_off":
+            self.brain.set_kill_switch(False)
+        elif action == "sensitivity":
+            self.brain.set_sensitivity(float(payload.get("value", 0.7)))
+        else:
+            return {"ok": False, "error": f"unknown action {action!r}"}
+        return {"ok": True, **self.brain.status()}
 
     def serve_forever(self) -> Tuple[str, int]:
         handler = self.make_handler()
