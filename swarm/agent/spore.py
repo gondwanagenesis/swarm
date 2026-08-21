@@ -22,6 +22,25 @@ from typing import Callable, List, Optional, Tuple
 from ..probe._proc import run_bounded
 
 POLL_S = 5.0
+DEBOUNCE_TICKS = 2
+
+
+def _tailscale_peers() -> List[str]:
+    """Peer watch via tailscale CLI when present — the mesh's authoritative
+    peer list, so ghost DHCP leases and ARP lies can't forge attachments."""
+    out = run_bounded(["tailscale", "status", "--json"], timeout=8.0)
+    if not out:
+        return []
+    import json
+
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return []
+    peers = data.get("Peer") or {}
+    return sorted(
+        p.get("HostName") or (p.get("TailscaleIPs") or [""])[0] for p in peers.values() if isinstance(p, dict)
+    )
 
 
 def _iface_names() -> List[str]:
@@ -40,36 +59,82 @@ def _adb_devices() -> List[str]:
 
 
 class AttachmentWatcher:
-    """Diffs attachment surfaces; fires callbacks with (channel, hint).
-    Cheap polling only — never raises."""
+    """Diffs attachment surfaces with a small debounce (ghost leases and ARP
+    lies die here), event wakeups under the hood where free, polling as the
+    portable spine everywhere else."""
 
-    def __init__(self, poll_s: float = POLL_S) -> None:
+    def __init__(self, poll_s: float = POLL_S, debounce: int = DEBOUNCE_TICKS) -> None:
         self.poll_s = poll_s
+        self.debounce = max(1, debounce)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._callbacks: List[Callable[[str, str], None]] = []
         self._ifaces: List[str] = []
         self._adb: List[str] = []
+        self._ts: List[str] = []
+        self._pending: dict = {}
 
     def on_attach(self, fn: Callable[[str, str], None]) -> None:
         self._callbacks.append(fn)
 
+    def _confirm(self, key: str, channel: str, hint: str) -> None:
+        seen = self._pending.get(key, 0) + 1
+        self._pending[key] = seen
+        if seen >= self.debounce:
+            del self._pending[key]
+            self._fire(channel, hint)
+
+    def _pass(self) -> None:
+        """Diff current surfaces against baseline. A surface item is adopted
+        into the baseline ONLY once confirmed — so a transient appearing on a
+        single pass (a ghost) never lands in the baseline, and a real
+        attachment confirms across consecutive passes."""
+        ifaces = _iface_names()
+        current_pending = set()
+        for iface in ifaces:
+            if iface in self._ifaces:
+                continue
+            key = f"if:{iface}"
+            was = self._pending.get(key, 0) + 1
+            self._pending[key] = was
+            current_pending.add(key)
+            if was >= self.debounce:
+                self._fire("interface", iface)
+                self._ifaces.append(iface)
+                self._pending.pop(key, None)
+        for key in [k for k in self._pending if k.startswith("if:") and k not in current_pending]:
+            del self._pending[key]
+
+        adb = _adb_devices()
+        for dev in adb:
+            if dev in self._adb:
+                continue
+            key = f"adb:{dev}"
+            was = self._pending.get(key, 0) + 1
+            self._pending[key] = was
+            if was >= self.debounce:
+                self._fire("adb", dev)
+                self._adb.append(dev)
+                self._pending.pop(key, None)
+
+        ts = _tailscale_peers()
+        for peer in ts:
+            if peer and peer not in self._ts:
+                key = f"ts:{peer}"
+                was = self._pending.get(key, 0) + 1
+                self._pending[key] = was
+                if was >= self.debounce:
+                    self._fire("tailscale", peer)
+                    self._ts.append(peer)
+                    self._pending.pop(key, None)
+
     def _loop(self) -> None:
         self._ifaces = _iface_names()
         self._adb = _adb_devices()
+        self._ts = _tailscale_peers()
         while not self._stop.wait(self.poll_s):
             try:
-                ifaces = _iface_names()
-                new_ifaces = [i for i in ifaces if i not in self._ifaces]
-                if new_ifaces:
-                    self._fire("interface", ",".join(new_ifaces))
-                self._ifaces = ifaces
-
-                adb = _adb_devices()
-                new_adb = [d for d in adb if d not in self._adb]
-                if new_adb:
-                    self._fire("adb", ",".join(new_adb))
-                self._adb = adb
+                self._pass()
             except Exception:
                 continue
 

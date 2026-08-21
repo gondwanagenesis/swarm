@@ -201,6 +201,21 @@ class Hub:
                         self.wfile.write(bundle)
                     elif path == "/api/spore/events":
                         self._send_json({"events": hub.enrollment.spore_events()})
+                    elif path == "/api/backup":
+                        from .backup import snapshot_with_meta
+
+                        snap = snapshot_with_meta(hub.registry._conn)
+                        body = snap["bytes"]
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/octet-stream")
+                        self.send_header(
+                            "Content-Disposition",
+                            f'attachment; filename="swarm-backup-{int(snap["at"])}.db"',
+                        )
+                        self.send_header("X-Backup-SHA256", snap["sha256"])
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
                     elif path == "/api/tokens":
                         self._send_json({"tokens": hub.enrollment.list_tokens()})
                     elif path == "/api/brain":

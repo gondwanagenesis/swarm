@@ -19,7 +19,9 @@ from typing import Callable, Dict, List, Optional, Tuple
 from ..core.models import DeviceInfo
 from .gpu import collect_devices
 
-DEFAULT_INTERVAL_S = 30.0
+DEFAULT_INTERVAL_S = 5.0
+MIN_INTERVAL_S = 2.0
+MAX_INTERVAL_S = 60.0
 
 
 def _diff_key(dev: DeviceInfo) -> str:
@@ -42,11 +44,13 @@ def diff_devices(
 
 
 class HotplugWatcher:
-    """Polls collect_devices on an interval; fires callbacks with the diff.
-    Daemon thread; stopping is cooperative."""
+    """Poll-diff watcher with adaptive backoff: fast tick after a change,
+    relaxes toward MAX_INTERVAL_S when the inventory is stable. Polling is the
+    portable spine (works identically on Windows/Linux/macOS/Termux); the
+    adaptivity keeps the CPU cost near zero while idle."""
 
     def __init__(self, interval: float = DEFAULT_INTERVAL_S) -> None:
-        self.interval = interval
+        self.base_interval = interval
         self._stop = threading.Event()
         self._callbacks: List[Callable[[List[DeviceInfo], List[DeviceInfo]], None]] = []
         self._known: List[DeviceInfo] = []
@@ -58,7 +62,8 @@ class HotplugWatcher:
     def _loop(self) -> None:
         known, anomalies = collect_devices()
         self._known = known
-        while not self._stop.wait(self.interval):
+        interval = self.base_interval
+        while not self._stop.wait(interval):
             try:
                 current, anomalies = collect_devices()
             except Exception:
@@ -66,11 +71,14 @@ class HotplugWatcher:
             added, removed, degraded = diff_devices(self._known, current)
             if added or removed:
                 self._known = current
+                interval = MIN_INTERVAL_S
                 for fn in self._callbacks:
                     try:
                         fn(added, removed)
                     except Exception:
                         continue
+            else:
+                interval = min(MAX_INTERVAL_S, interval * 1.5)
 
     def start(self) -> threading.Thread:
         self._stop.clear()

@@ -69,6 +69,7 @@ class Agent:
         node_id: Optional[str] = None,
         token: Optional[str] = None,
         role: str = "node",
+        ignore_welfare: bool = False,
     ) -> None:
         parsed = urlparse(hub_url if "://" in hub_url else "http://" + hub_url)
         self.hub_host = parsed.hostname or "127.0.0.1"
@@ -81,6 +82,7 @@ class Agent:
         self.registered = False
         self.node_id = ""
         self.last_bench_at = 0.0
+        self.ignore_welfare = ignore_welfare
         self._stop = threading.Event()
 
     def _post(self, path: str, payload: Dict[str, Any], timeout: float = 10.0) -> Optional[Dict[str, Any]]:
@@ -276,11 +278,17 @@ class Agent:
         from .welfare import welfare_gate
 
         idle = 0.0
+        blocked_logged = False
         while not self._stop.is_set():
-            welfare = welfare_gate()
-            if not welfare["allowed"]:
-                time.sleep(max(poll_seconds, WELFARE_CHECK_S))
-                continue
+            if not self.ignore_welfare:
+                welfare = welfare_gate()
+                if not welfare["allowed"]:
+                    if not blocked_logged:
+                        print(f"[welfare] worker parked: {welfare['reason']}", flush=True)
+                        blocked_logged = True
+                    time.sleep(max(poll_seconds, WELFARE_CHECK_S))
+                    continue
+                blocked_logged = False
             resp = self._post("/api/tasks/pull", {"node_id": self.node_id})
             tasks = (resp or {}).get("tasks") or []
             if not tasks:

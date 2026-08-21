@@ -41,7 +41,7 @@ def main() -> int:
     print(f"[hub] http://127.0.0.1:{port}")
 
     agents = [
-        Agent(hub_url=f"http://127.0.0.1:{port}", bench=False, node_id=f"w{i}") for i in range(3)
+        Agent(hub_url=f"http://127.0.0.1:{port}", bench=False, node_id=f"w{i}", ignore_welfare=True) for i in range(3)
     ]
     threads = []
     for i, agent in enumerate(agents):
