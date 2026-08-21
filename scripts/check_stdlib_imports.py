@@ -30,6 +30,7 @@ BASELINE = {
     "time",
     "math",
     "socket",
+    "socketserver",
     "struct",
     "subprocess",
     "threading",
