@@ -34,6 +34,30 @@ from .ops import OPS
 HEARTBEAT_SECONDS = 30.0
 IDLE_BACKOFF_MAX = 10.0
 LEASE_RENEW_FRACTION = 1.0 / 3.0
+WELFARE_CHECK_S = 30.0
+
+
+def bundled_config() -> Dict[str, Any]:
+    """When running from a .pyz bundle, the hub may have baked in
+    swarm_config.json (hub URL + enrollment token). Env var overrides."""
+    import zipfile
+
+    cfg: Dict[str, Any] = {}
+    try:
+        archive = sys.argv[0] if sys.argv and sys.argv[0].endswith(".pyz") else None
+        if archive:
+            with zipfile.ZipFile(archive) as zf:
+                if "swarm_config.json" in zf.namelist():
+                    cfg = json.loads(zf.read("swarm_config.json").decode("utf-8"))
+    except Exception:
+        pass
+    import os
+
+    if os.environ.get("SWARM_TOKEN"):
+        cfg["token"] = os.environ["SWARM_TOKEN"]
+    if os.environ.get("SWARM_HUB"):
+        cfg["hub"] = os.environ["SWARM_HUB"]
+    return cfg
 
 
 class Agent:
@@ -43,6 +67,8 @@ class Agent:
         bench: bool = True,
         rebench_interval: float = 86400.0,
         node_id: Optional[str] = None,
+        token: Optional[str] = None,
+        role: str = "node",
     ) -> None:
         parsed = urlparse(hub_url if "://" in hub_url else "http://" + hub_url)
         self.hub_host = parsed.hostname or "127.0.0.1"
@@ -50,6 +76,8 @@ class Agent:
         self.do_bench = bench
         self.rebench_interval = rebench_interval
         self.node_id_override = node_id
+        self.token = token
+        self.role = role
         self.registered = False
         self.node_id = ""
         self.last_bench_at = 0.0
@@ -94,6 +122,8 @@ class Agent:
             "benchmarks": [to_dict(b) for b in benches],
             "pilot": pilot,
             "bindings": bindings,
+            "token": self.token,
+            "role": self.role,
         }
         resp = self._post("/api/register", payload)
         if resp and resp.get("ok"):
@@ -111,7 +141,14 @@ class Agent:
             watcher = None
         try:
             while True:
-                resp = self._post("/api/heartbeat", {"node_id": self.node_id})
+                welfare = None
+                try:
+                    from .welfare import battery_state, user_idle_seconds
+
+                    welfare = {"battery": battery_state(), "user_idle_s": user_idle_seconds()}
+                except Exception:
+                    welfare = None
+                resp = self._post("/api/heartbeat", {"node_id": self.node_id, "welfare": welfare})
                 if resp is None or not resp.get("ok"):
                     self.registered = False
                     self.probe_and_register()
@@ -130,6 +167,60 @@ class Agent:
         interval; full_probe re-runs are cheap on known machines."""
         time.sleep(2.0)
         self.probe_and_register()
+
+    def run_seed(self, offer_hook: Optional[Any] = None) -> None:
+        """Spore mode: probe-lite, register role=seed, watch for attachment,
+        fire an event to the hub on every arrival. Consent happens on the
+        attached device; the seed never self-installs."""
+        from .spore import AttachmentWatcher
+
+        watcher = AttachmentWatcher()
+        watcher.on_attach(self._on_attachment)
+        watcher.start()
+
+        def serve(page: str) -> None:
+            import socketserver
+
+            class Handler(
+                __import__("http.server", fromlist=["BaseHTTPRequestHandler"]).BaseHTTPRequestHandler
+            ):
+                def do_GET(self):
+                    body = page.encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def log_message(self, *args):
+                    return
+
+            class Server(socketserver.ThreadingTCPServer):
+                allow_reuse_address = True
+                daemon_threads = True
+
+            server = Server(("0.0.0.0", 8788), Handler)
+            server.serve_forever()
+
+        hub_url = f"http://{self.hub_host}:{self.hub_port}"
+        page = (
+            "<html><body style='font-family:sans-serif;padding:2em'>"
+            "<h1>Swarm seed detected</h1>"
+            "<p>This device attached to a swarm seed. One click joins the swarm — "
+            "the agent runs in userspace, never installs without your consent.</p>"
+            f"<p><a href='{hub_url}/invite'>Join this swarm</a></p>"
+            "</body></html>"
+        )
+        threading.Thread(target=serve, args=(page,), daemon=True, name="swarm-seed-serve").start()
+        while not self._stop.is_set():
+            time.sleep(1.0)
+        watcher.stop()
+
+    def _on_attachment(self, channel: str, hint: str) -> None:
+        self._post(
+            "/api/spore/event",
+            {"seed_node_id": self.node_id or "seed", "channel": channel, "peer_hint": hint},
+        )
 
     def run_once(self) -> bool:
         return self.probe_and_register()
@@ -182,8 +273,14 @@ class Agent:
             )
 
     def work_forever(self, poll_seconds: float = 2.0) -> None:
+        from .welfare import welfare_gate
+
         idle = 0.0
         while not self._stop.is_set():
+            welfare = welfare_gate()
+            if not welfare["allowed"]:
+                time.sleep(max(poll_seconds, WELFARE_CHECK_S))
+                continue
             resp = self._post("/api/tasks/pull", {"node_id": self.node_id})
             tasks = (resp or {}).get("tasks") or []
             if not tasks:
@@ -209,15 +306,27 @@ class Agent:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    cfg = bundled_config()
     parser = argparse.ArgumentParser(description="Swarm node agent")
-    parser.add_argument("--hub", default="http://127.0.0.1:8777")
+    parser.add_argument("--hub", default=cfg.get("hub", "http://127.0.0.1:8777"))
+    parser.add_argument("--token", default=cfg.get("token"))
     parser.add_argument("--no-bench", action="store_true", help="probe only, skip benchmarks")
     parser.add_argument("--once", action="store_true", help="register once and exit")
     parser.add_argument("--work", action="store_true", help="also run the pull-based worker loop")
     parser.add_argument("--poll", type=float, default=2.0)
+    parser.add_argument(
+        "--seed",
+        action="store_true",
+        help="spore mode: probe-lite, watch for attached devices, serve the one-click invite page",
+    )
     args = parser.parse_args(argv)
 
-    agent = Agent(hub_url=args.hub, bench=not args.no_bench)
+    agent = Agent(
+        hub_url=args.hub,
+        bench=not args.no_bench,
+        token=args.token,
+        role="seed" if args.seed else "node",
+    )
     t0 = time.time()
     ok = agent.probe_and_register()
     elapsed = time.time() - t0
@@ -227,11 +336,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             file=sys.stderr,
         )
     else:
-        print(f"agent: registered as {agent.node_id[:8]} in {elapsed:.1f}s")
+        print(f"agent: registered as {agent.node_id[:8]} ({agent.role}) in {elapsed:.1f}s")
+    if args.seed:
+        print("agent: seed posture — watching for attached devices, invite page on :8788")
+        agent.run_seed()
+        return 0
     if args.once:
         return 0 if ok else 1
     if args.work:
-        print("agent: worker loop started (pull-based, chunk sized to measured throughput)")
+        print("agent: worker loop started (pull-based, chunk sized to measured throughput, welfare-gated)")
         agent.start_worker(poll_seconds=args.poll)
     agent.heartbeat_forever()
     return 0

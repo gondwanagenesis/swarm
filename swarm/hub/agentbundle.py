@@ -27,7 +27,7 @@ if __name__ == "__main__":
 '''
 
 
-def build_agent_pyz(output: Union[str, Path, None] = None, source_root: Optional[Path] = None) -> bytes:
+def build_agent_pyz(output: Union[str, Path, None] = None, source_root: Optional[Path] = None, config: Optional[dict] = None) -> bytes:
     """Build the single-file agent. Returns the pyz bytes; also writes to
     `output` if a path is given. Only stdlib packages are bundled."""
     if source_root:
@@ -56,6 +56,10 @@ def build_agent_pyz(output: Union[str, Path, None] = None, source_root: Optional
                 arcname = "swarm/" + "/".join(py_file.relative_to(pkg_root).parts)
                 zf.write(py_file, arcname)
                 files.append(arcname)
+        if config:
+            import json as _json
+
+            zf.writestr("swarm_config.json", _json.dumps(config, sort_keys=True))
     payload = buf.getvalue()
     if output:
         Path(output).write_bytes(payload)

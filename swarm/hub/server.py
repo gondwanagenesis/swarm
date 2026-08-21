@@ -26,6 +26,7 @@ from ..core.models import BenchResult, LinkMeasurement, NodeProfile
 from ..core.serde import from_dict
 from ..integrator.llm import from_env as llm_from_env
 from .dashboard import render_dashboard
+from .enrollment import Enrollment
 from .queue import WorkQueue
 from .registry import Registry
 from .scheduler import ChunkPlanner
@@ -43,11 +44,19 @@ def _swarm_version() -> str:
 
 
 class Hub:
-    def __init__(self, host: str = "127.0.0.1", port: int = 8777, db_path: str = ":memory:") -> None:
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 8777,
+        db_path: str = ":memory:",
+        require_token: bool = False,
+    ) -> None:
         self.host = host
         self.port = port
+        self.require_token = require_token
         self.registry = Registry(db_path)
         self.queue = WorkQueue(self.registry._conn, lock=self.registry._lock)
+        self.enrollment = Enrollment(self.registry._conn, lock=self.registry._lock)
         self.planner = ChunkPlanner(self.registry)
         self.llm_config = llm_from_env()
         self.agent_payload: Optional[bytes] = None
@@ -158,6 +167,35 @@ class Hub:
                         self._send_json({"verdicts": hub.registry.list_verdicts()})
                     elif path == "/api/bindings":
                         self._send_json({"bindings": hub.registry.list_bindings()})
+                    elif path == "/invite" or path.startswith("/invite/"):
+                        token = path.rsplit("/", 1)[-1] if path != "/invite" else ""
+                        if not token or hub.enrollment.validate(token) is None:
+                            minted = hub.enrollment.create(role="node", label="invite-page")
+                            token = minted["token"]
+                        self._send_html(hub._invite_page(token))
+                    elif path == "/bundle.pyz":
+                        from urllib.parse import parse_qs, urlparse
+
+                        q = parse_qs(urlparse(self.path).query)
+                        token = (q.get("token") or [""])[0]
+                        if hub.enrollment.validate(token) is None:
+                            self._send_json({"ok": False, "error": "invalid or expired token"}, status=403)
+                            return
+                        from .agentbundle import build_agent_pyz
+
+                        bundle = build_agent_pyz(
+                            config={"hub": f"http://{hub.host}:{hub.port}", "token": token}
+                        )
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/octet-stream")
+                        self.send_header("Content-Disposition", "attachment; filename=swarm-agent.pyz")
+                        self.send_header("Content-Length", str(len(bundle)))
+                        self.end_headers()
+                        self.wfile.write(bundle)
+                    elif path == "/api/spore/events":
+                        self._send_json({"events": hub.enrollment.spore_events()})
+                    elif path == "/api/tokens":
+                        self._send_json({"tokens": hub.enrollment.list_tokens()})
                     elif path == "/api/bags":
                         self._send_json({"bags": hub.queue.open_bags()})
                     elif path.startswith("/api/bag/"):
@@ -215,6 +253,14 @@ class Hub:
                             list(payload.get("results") or []),
                         )
                         self._send_json({"ok": True, **outcome})
+                    elif path == "/api/spore/event":
+                        payload = self._read_json()
+                        hub.enrollment.log_spore_event(
+                            str(payload.get("seed_node_id", "")),
+                            str(payload.get("channel", "")),
+                            str(payload.get("peer_hint", "")),
+                        )
+                        self._send_json({"ok": True})
                     elif path == "/api/tasks/renew":
                         payload = self._read_json()
                         renewed = hub.queue.renew(
@@ -250,7 +296,27 @@ class Hub:
 
         return Handler
 
+    def _invite_page(self, token: str) -> str:
+        return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Join the swarm</title>
+<style>body{{font-family:system-ui,sans-serif;background:#0f1215;color:#dde2e7;display:flex;justify-content:center;padding:10vh 1em 0}}
+.card{{max-width:520px;background:#171c22;border:1px solid #2a3038;border-radius:10px;padding:2em}}
+h1{{font-size:20px;color:#3cc492;margin-top:0}} code{{background:#0f1215;padding:2px 6px;border-radius:4px;font-size:12px}}
+a.btn{{display:inline-block;background:#3cc492;color:#0f1215;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:600;margin-top:1em}}</style></head>
+<body><div class="card"><h1>Join this swarm</h1>
+<p>Your device was detected near an enrolled swarm seed. Joining runs a userspace agent that measures this machine's compute and shares spare cycles.</p>
+<p><strong>No root. No kernel. No startup persistence without consent.</strong> You can revoke anytime.</p>
+<p>Enrollment token: <code>{token[:12]}&hellip;</code></p>
+<a class="btn" href="/bundle.pyz?token={token}">Download swarm-agent.pyz</a>
+<p style="color:#556069;font-size:12px;margin-top:1.5em">Then run: <code>python swarm-agent.pyz --work</code> (bare Python 3.9+, no dependencies)</p>
+</div></body></html>"""
+
     def handle_register(self, payload: Dict[str, Any]) -> str:
+        if self.require_token:
+            token = str(payload.get("token") or "")
+            valid = self.enrollment.validate(token)
+            if valid is None:
+                raise ValueError("missing or invalid enrollment token (hub is in token-required mode)")
         profile_data = payload.get("profile") or {}
         capability_data = payload.get("capability") or {}
         profile = from_dict(NodeProfile, profile_data)

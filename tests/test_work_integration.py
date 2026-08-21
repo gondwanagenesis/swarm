@@ -103,7 +103,14 @@ def test_atemporal_duplicate_completion_is_noop():
         hub.stop()
 
 
-def test_worker_thread_drains_bag():
+def test_worker_thread_drains_bag(monkeypatch):
+    import swarm.agent.welfare as welfare_mod
+
+    monkeypatch.setattr(
+        welfare_mod,
+        "welfare_gate",
+        lambda: {"allowed": True, "reason": "test-pinned", "details": {}},
+    )
     hub = Hub(host="127.0.0.1", port=0)
     _, port = hub.start_background()
     try:
