@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        python: ["3.9", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install dev deps
+        run: python -m pip install --upgrade pip && python -m pip install pytest ruff
+      - name: Lint
+        run: ruff check swarm/ scripts/ tests/
+      - name: Stdlib import gate (agent-side packages)
+        run: python scripts/check_stdlib_imports.py swarm/core swarm/probe swarm/bench swarm/agent swarm/transport
+      - name: Tests
+        run: python -m pytest tests/ -x --tb=short -q

@@ -1,0 +1,52 @@
+"""swarm.core — shared types, serde, identity. Stdlib only, imports everywhere."""
+
+from .identity import adapter_id, canonical_hash, get_node_id, result_hash
+from .models import (
+    AdapterOrigin,
+    AdapterRecord,
+    AgentCapability,
+    Anomaly,
+    BenchResult,
+    CpuInfo,
+    DeviceInfo,
+    LinkMeasurement,
+    MeasurementTrust,
+    MemoryInfo,
+    NodeCapability,
+    NodeProfile,
+    PowerReading,
+    PowerTrust,
+    Severity,
+    TaskResult,
+    TaskSpec,
+)
+from .serde import canonical_json, dumps, from_dict, loads, to_dict
+
+__all__ = [
+    "AdapterOrigin",
+    "AdapterRecord",
+    "AgentCapability",
+    "Anomaly",
+    "BenchResult",
+    "CpuInfo",
+    "DeviceInfo",
+    "LinkMeasurement",
+    "MeasurementTrust",
+    "MemoryInfo",
+    "NodeCapability",
+    "NodeProfile",
+    "PowerReading",
+    "PowerTrust",
+    "Severity",
+    "TaskResult",
+    "TaskSpec",
+    "adapter_id",
+    "canonical_hash",
+    "canonical_json",
+    "dumps",
+    "from_dict",
+    "get_node_id",
+    "loads",
+    "result_hash",
+    "to_dict",
+]
