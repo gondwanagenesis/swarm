@@ -23,6 +23,6 @@ jobs:
       - name: Lint
         run: ruff check swarm/ scripts/ tests/
       - name: Stdlib import gate (agent-side packages)
-        run: python scripts/check_stdlib_imports.py swarm/core swarm/probe swarm/bench swarm/agent swarm/transport
+        run: python scripts/check_stdlib_imports.py swarm/core swarm/probe swarm/bench swarm/agent swarm/transport swarm/integrator
       - name: Tests
         run: python -m pytest tests/ -x --tb=short -q

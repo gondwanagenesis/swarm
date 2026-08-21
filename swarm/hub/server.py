@@ -19,17 +19,27 @@ import contextlib
 import json
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from ..core.identity import canonical_hash
 from ..core.models import BenchResult, LinkMeasurement, NodeProfile
 from ..core.serde import from_dict
+from ..integrator.llm import from_env as llm_from_env
 from .dashboard import render_dashboard
 from .queue import WorkQueue
 from .registry import Registry
 from .scheduler import ChunkPlanner
 
 MAX_BODY = 64 * 1024 * 1024
+
+
+def _swarm_version() -> str:
+    try:
+        import swarm
+
+        return swarm.__version__
+    except Exception:
+        return "unknown"
 
 
 class Hub:
@@ -39,8 +49,13 @@ class Hub:
         self.registry = Registry(db_path)
         self.queue = WorkQueue(self.registry._conn, lock=self.registry._lock)
         self.planner = ChunkPlanner(self.registry)
+        self.llm_config = llm_from_env()
+        self.agent_payload: Optional[bytes] = None
         self.started_at = time.time()
         self._httpd = None
+
+    def set_agent_payload(self, payload: bytes) -> None:
+        self.agent_payload = payload
 
     def make_handler(self) -> type:
         hub = self
@@ -90,6 +105,28 @@ class Hub:
                     path = self.path.split("?", 1)[0]
                     if path == "/api/ping":
                         self._send_json({"ok": True, "ts": time.time()})
+                    elif path == "/api/config":
+                        self._send_json(
+                            {
+                                "llm": hub.llm_config.status(),
+                                "version": _swarm_version(),
+                                "uptime_s": round(time.time() - hub.started_at, 1),
+                            }
+                        )
+                    elif path == "/agent.pyz":
+                        if hub.agent_payload is None:
+                            self._send_json(
+                                {"ok": False, "error": "agent bundle not built on this hub"},
+                                status=404,
+                            )
+                        else:
+                            body = hub.agent_payload
+                            self.send_response(200)
+                            self.send_header("Content-Type", "application/octet-stream")
+                            self.send_header("Content-Disposition", "attachment; filename=swarm-agent.pyz")
+                            self.send_header("Content-Length", str(len(body)))
+                            self.end_headers()
+                            self.wfile.write(body)
                     elif path == "/api/nodes":
                         self._send_json({"nodes": hub.registry.list_nodes()})
                     elif path.startswith("/api/nodes/"):
@@ -252,8 +289,19 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8777)
     parser.add_argument("--db", default=":memory:", help="sqlite path (default in-memory)")
+    parser.add_argument(
+        "--serve-agent",
+        action="store_true",
+        help="build and serve the single-file agent at /agent.pyz",
+    )
     args = parser.parse_args()
     hub = Hub(host=args.host, port=args.port, db_path=args.db)
+    if args.serve_agent:
+        from .agentbundle import build_agent_pyz
+
+        payload = build_agent_pyz()
+        hub.set_agent_payload(payload)
+        print(f"agent bundle ready at /agent.pyz ({len(payload)} bytes)")
     print(f"swarm hub listening on http://{args.host}:{args.port} (dashboard at /)")
     try:
         hub.serve_forever()

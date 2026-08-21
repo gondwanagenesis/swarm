@@ -73,6 +73,40 @@ curl -X POST http://127.0.0.1:8777/api/bag/submit \
 
 Available ops: `primesum` (`{"n": int}`) and `hashwork` (`{"seed", "rounds"}`).
 
+## Enrolling a node (M4.5-lite)
+
+The agent is stdlib-only, so it ships as **one file**:
+
+```sh
+python scripts/build_agent_pyz.py       # produces swarm-agent.pyz (~25 KB)
+# or have the hub serve it: python -m swarm.hub.server --serve-agent
+# then on the node:
+curl -O http://hub-host:8777/agent.pyz
+python agent.pyz --hub http://hub-host:8777          # probe + bench + register
+python agent.pyz --hub http://hub-host:8777 --work   # also pull work
+```
+
+Runs on bare CPython 3.9+ — a Pi, a Termux phone, an old distro. Fleet tokens,
+signed bundles, and MDM/Ansible push are the full M4.5 milestone; this is the
+manual path that works today. Deploy over your mesh (Tailscale) or verify the
+bundle hash out-of-band.
+
+## Optional: arming the AI (M4 groundwork)
+
+The hub talks to any OpenAI-compatible provider **or NeuralWatt** for adapter
+synthesis — but only if you set a key. No key, no network calls, full
+functionality without it.
+
+```sh
+set SWARM_NEURALWATT_API_KEY=your-key        # NeuralWatt
+set SWARM_LLM_API_KEY=sk-...                 # any OpenAI-compatible provider
+set SWARM_LLM_BASE_URL=https://api.x.ai/v1   # optional override
+set SWARM_LLM_MODEL=model-id                 # optional override
+```
+
+Check what the hub is armed with (never reveals the key):
+`GET http://hub:8777/api/config`
+
 ## Layout
 
 | Path | Runs where | Dependencies | Purpose |

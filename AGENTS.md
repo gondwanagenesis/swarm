@@ -74,13 +74,18 @@ Code that needs an external capability (a tool, a package, a runtime) must:
 
 ## Milestones (build order is sacred)
 
-- **M1 (current):** probe + capability tower + benchmarks + hub registry + link
-  measurement + dashboard. See everything, do nothing.
-- M2: pull-based bag-of-tasks, leases, idempotency, content-addressed results.
-- M3: tail shrinking, hedging at p90, node tiers from track record.
-- M4: integrator — Tier 0 discovery, AI adapter synthesis, contract gate, trial cells.
-- M4.5: enrollment tokens, fleet push, resource invisibility control loop.
+- **M1 (done):** probe + capability tower + benchmarks + hub registry + link
+  measurement + dashboard.
+- **M2 (done):** pull-based bag-of-tasks, leases + renewal + expiry sweep,
+  confidence-weighted chunks with guided tail shrink, idempotent
+  content-addressed results. Proven: kill-node mid-batch completes exactly once.
+- M3: tail hedging at p90/p95, suspend consistently-failing nodes, node tiers
+  (Core/Elastic/Opportunistic) derived from track record.
+- M4: integrator — Tier 0 discovery, AI adapter synthesis (LLM client config
+  exists; provider-agnostic, armed only by env key), contract gate, trial cells.
+- M4.5 (partial): single-file agent bundle (`/agent.pyz`) + manual enrollment
+  exist; fleet tokens, signed bundles, resource-invisibility control loop remain.
 - M5: pipeline-parallel inference, speculative decoding.
 - M6: multi-model packing, small-model fine-tuning, adaptive replication.
 
-Do not build M4 features while M2 is unfinished.
+Do not build M4 features while M2/M3 invariants are untested.
