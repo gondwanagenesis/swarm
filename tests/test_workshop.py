@@ -16,8 +16,8 @@ from swarm.hub.registry import Registry
 from swarm.hub.workshop import Workshop
 
 
-def _ws(repo: Path) -> Workshop:
-    return Workshop(Registry(":memory:")._conn, repo)
+def _ws(repo: Path, autopilot: bool = False) -> Workshop:
+    return Workshop(Registry(":memory:")._conn, repo, autopilot=autopilot)
 
 
 def test_gate_rejects_syntax_error():
@@ -62,3 +62,28 @@ def test_ledger_records_everything():
     ws.propose("bad", "proof", {"swarm/core/_x.py": "def f(:"})
     rows = ws.ledger()
     assert rows and rows[0]["status"] == "rejected"
+
+
+def test_autopilot_applies_green_without_human():
+    ws = _ws(Path.cwd(), autopilot=True)
+    good = ws.propose(
+        "add answer",
+        "autopilot proof",
+        {
+            "swarm/core/_tmp_auto.py": "def auto() -> int:\n    return 7\n",
+            "tests/test__tmp_auto.py": "from swarm.core._tmp_auto import auto\n\n\ndef test_a():\n    assert auto() == 7\n",
+        },
+    )
+    assert good["status"] == "applied"
+    assert good.get("autopilot") is True
+    assert Path("swarm/core/_tmp_auto.py").exists()
+    ws.rollback(good["patch_id"])
+    assert not Path("swarm/core/_tmp_auto.py").exists()
+
+
+def test_autopilot_cannot_ramm_a_bad_patch():
+    ws = _ws(Path.cwd(), autopilot=True)
+    bad = ws.propose("evil", "proof", {"swarm/core/_bad_auto.py": "def f(:"})
+    assert bad["status"] == "rejected"
+    with pytest.raises(ValueError):
+        ws.approve_and_apply(bad["patch_id"])

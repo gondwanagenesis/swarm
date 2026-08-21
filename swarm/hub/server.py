@@ -67,10 +67,16 @@ class Hub:
             frontier=self.llm_config,
             local=local_brain_config_from_env(),
         )
+        import os
+
         from .workshop import Workshop
 
+        autopilot_env = os.environ.get("SWARM_AUTOPILOT", "1")
         self.workshop = Workshop(
-            self.registry._conn, Path(__file__).resolve().parents[2], lock=self.registry._lock
+            self.registry._conn,
+            Path(__file__).resolve().parents[2],
+            lock=self.registry._lock,
+            autopilot=autopilot_env not in ("0", "false", "no"),
         )
         self.agent_payload: Optional[bytes] = None
         self.started_at = time.time()
@@ -527,6 +533,10 @@ a.btn{{display:inline-block;background:#3cc492;color:#0f1215;padding:12px 24px;b
             self.brain.set_kill_switch(False)
         elif action == "sensitivity":
             self.brain.set_sensitivity(float(payload.get("value", 0.7)))
+        elif action == "autopilot_on":
+            self.workshop.autopilot = True
+        elif action == "autopilot_off":
+            self.workshop.autopilot = False
         else:
             return {"ok": False, "error": f"unknown action {action!r}"}
         return {"ok": True, **self.brain.status()}

@@ -78,13 +78,18 @@ The swarm may edit its own source — but ONLY through `swarm.hub.workshop`:
 
 1. Every change is a *proposal*: sandboxed against the full test suite +
    stdlib-import gate. A red gate means the change never touches the tree.
-2. Human approval is the membrane. Applying requires an explicit operator
-   POST. No silent auto-apply.
-3. Every propose/apply/rollback lands in the patch ledger with content hashes.
+   The gate is the membrane.
+2. Autopilot is the default: green-gated patches apply themselves. Human
+   approval is *admin tooling*, not a gate — disable autopilot from admin
+   mode (`/api/brain/admin {"action":"autopilot_off"}` or `SWARM_AUTOPILOT=0`)
+   when you want to hold the reins. Rollback always stays available.
+3. Plug-in consent is different law: the seed's expand-onto-device flow still
+   requires the click/zero-click-by-token path. Self-healing is automated;
+   colonization is consented.
+4. Every propose/apply/rollback lands in the patch ledger with content hashes.
    Rollback restores exact bytes.
-4. Workshop code can never edit outside the repo, never produce binary/git
-   internals, and workshop tests never recurse (sandbox sets
-   SWARM_WORKSHOP_SANDBOX=1).
+5. Workshop code can never edit outside the repo, never produce binary/git
+   internals, and workshop tests never recurse (`SWARM_WORKSHOP_SANDBOX=1`).
 
 The organism heals itself the way it earns trust: by proof, not permission.
 

@@ -55,10 +55,15 @@ def _hash(text: str) -> str:
 
 class Workshop:
     def __init__(
-        self, registry_conn: sqlite3.Connection, repo_root: Path, lock: Optional[threading.RLock] = None
+        self,
+        registry_conn: sqlite3.Connection,
+        repo_root: Path,
+        lock: Optional[threading.RLock] = None,
+        autopilot: bool = True,
     ) -> None:
         self.conn = registry_conn
         self.root = Path(repo_root).resolve()
+        self.autopilot = autopilot
         self._lock = lock or threading.RLock()
         self.conn.executescript(SCHEMA)
         self.conn.commit()
@@ -110,6 +115,15 @@ class Workshop:
                 ),
             )
             self.conn.commit()
+        if gate_ok and self.autopilot:
+            try:
+                applied = self.approve_and_apply(patch_id)
+                record["status"] = "applied"
+                record["applied_at"] = applied["applied_at"]
+                record["autopilot"] = True
+            except Exception as exc:
+                record["status"] = "staged"
+                record["autopilot_error"] = str(exc)
         return record
 
     def _sandbox_test(self, files: Dict[str, str]) -> tuple:
@@ -127,7 +141,10 @@ class Workshop:
             ok_all = True
             for label, cmd in (
                 ("compileall", [sys.executable, "-m", "compileall", "-q", "swarm"]),
-                ("pytest", [sys.executable, "-m", "pytest", "tests", "-q", "-x", "--tb=line", "-k", "not workshop"]),
+                (
+                    "pytest",
+                    [sys.executable, "-m", "pytest", "tests", "-q", "-x", "--tb=line", "-k", "not workshop"],
+                ),
                 (
                     "stdlib-gate",
                     [
@@ -143,8 +160,14 @@ class Workshop:
                 ),
             ):
                 try:
-                    proc = subprocess.run(cmd, cwd=str(dest), capture_output=True, text=True, timeout=600,
-                                          env=dict(os.environ, SWARM_WORKSHOP_SANDBOX="1"))
+                    proc = subprocess.run(
+                        cmd,
+                        cwd=str(dest),
+                        capture_output=True,
+                        text=True,
+                        timeout=600,
+                        env=dict(os.environ, SWARM_WORKSHOP_SANDBOX="1"),
+                    )
                 except Exception as exc:
                     logs.append(f"[{label}] harness error: {exc}")
                     ok_all = False
@@ -162,7 +185,7 @@ class Workshop:
         if not row["gate_ok"] or row["status"] != "staged":
             raise ValueError("patch not in staged-with-green-gate state")
         files = json.loads(row["files_json"])
-        backup: Dict[str, str] = {}
+        backup: Dict[str, Optional[str]] = {}
         for rel in files:
             p = self.root / rel
             backup[rel] = p.read_text(encoding="utf-8") if p.exists() else None
