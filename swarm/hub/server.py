@@ -145,6 +145,10 @@ class Hub:
                         from .coverage import coverage_report
 
                         self._send_json(coverage_report(hub.registry))
+                    elif path == "/api/fleet-power":
+                        from .fleet_power import fleet_power
+
+                        self._send_json(fleet_power(hub.registry))
                     elif path == "/api/bags":
                         self._send_json({"bags": hub.queue.open_bags()})
                     elif path.startswith("/api/bag/"):

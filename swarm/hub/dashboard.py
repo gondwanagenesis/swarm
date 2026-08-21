@@ -84,6 +84,38 @@ def _ago(ts: Optional[float]) -> str:
     return f"{delta / 3600:.1f}h ago"
 
 
+def _fleet_power_rows(registry: Registry) -> str:
+    try:
+        from .fleet_power import fleet_power
+
+        report = fleet_power(registry)
+    except Exception:
+        return '<tr><td colspan="3" class="none">fleet power unavailable</td></tr>'
+    rows: List[str] = []
+    labels = {
+        "cpu_fp32_gflops": "CPU FP32",
+        "mem_bandwidth_gbps": "Memory BW",
+        "mem_latency_ns": "Memory Latency",
+    }
+    units = {"cpu_fp32_gflops": "GFLOPS", "mem_bandwidth_gbps": "GB/s", "mem_latency_ns": "ns"}
+    for kind, buckets in report.get("totals", {}).items():
+        proven = buckets.get("proven", 0.0)
+        fallback = buckets.get("fallback", 0.0)
+        rows.append(
+            "<tr><td class='mono'>%s</td>"
+            "<td class='mono'>%.3f %s</td>"
+            "<td class='mono'>%.3f %s</td></tr>"
+            % (
+                html.escape(str(labels.get(kind, kind))),
+                float(proven),
+                units.get(kind, ""),
+                float(fallback),
+                units.get(kind, ""),
+            )
+        )
+    return "".join(rows) or '<tr><td colspan="3" class="none">no benchmarks yet</td></tr>'
+
+
 def render_dashboard(registry: Registry, queue: Optional[WorkQueue] = None) -> str:
     nodes = registry.list_nodes()
     links = registry.list_links()
@@ -171,7 +203,11 @@ def render_dashboard(registry: Registry, queue: Optional[WorkQueue] = None) -> s
 <meta http-equiv="refresh" content="15">
 <style>{STYLE}</style></head><body>
 <h1>Swarm &mdash; measured, not declared</h1>
-<div class="meta">values shown with their trust tier; &mdash; means "we could not measure it"</div>
+<div class="meta">values shown with their trust tier; &mdash; means "we could not measure it" &middot; <a href="/api/fleet-power" style="color:#3cc492">/api/fleet-power</a></div>
+<h2>Fleet Power ({len(nodes)} nodes)</h2>
+<table><tr><th>Measure</th><th>Proven total</th><th>Fallback-tier total</th></tr>
+{_fleet_power_rows(registry)}
+</table>
 <h2>Nodes ({len(nodes)})</h2>
 <table><tr><th>Node</th><th>OS / Arch</th><th>CPU / Free mem</th><th>Devices</th><th>Tower</th><th>Benchmarks</th><th>Seen</th></tr>
 {
