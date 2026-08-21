@@ -141,6 +141,10 @@ class Hub:
                         self._send_json({"links": hub.registry.list_links()})
                     elif path == "/api/anomalies":
                         self._send_json({"anomalies": hub.registry.recent_anomalies()})
+                    elif path == "/api/coverage":
+                        from .coverage import coverage_report
+
+                        self._send_json(coverage_report(hub.registry))
                     elif path == "/api/bags":
                         self._send_json({"bags": hub.queue.open_bags()})
                     elif path.startswith("/api/bag/"):

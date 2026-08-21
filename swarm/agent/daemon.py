@@ -24,6 +24,7 @@ from urllib.parse import urlparse
 from ..bench.fallback import run_floor_benchmarks
 from ..core.models import BenchResult
 from ..core.serde import to_dict
+from ..probe.hotplug import HotplugWatcher
 from ..probe.orchestrator import full_probe
 from ..transport.link import LinkProber
 from .ops import OPS
@@ -88,16 +89,34 @@ class Agent:
         return self.registered
 
     def heartbeat_forever(self) -> None:
-        while True:
-            resp = self._post("/api/heartbeat", {"node_id": self.node_id})
-            if resp is None or not resp.get("ok"):
-                self.registered = False
-                self.probe_and_register()
-            elif self.do_bench and (time.time() - self.last_bench_at) > self.rebench_interval:
-                run_floor_benchmarks()
-                self.last_bench_at = time.time()
-                self._post("/api/heartbeat", {"node_id": self.node_id})
-            time.sleep(HEARTBEAT_SECONDS)
+        watcher: Optional[HotplugWatcher] = None
+        try:
+            watcher = HotplugWatcher()
+            watcher.on_change(self._on_devices_changed)
+            watcher.start()
+        except Exception:
+            watcher = None
+        try:
+            while True:
+                resp = self._post("/api/heartbeat", {"node_id": self.node_id})
+                if resp is None or not resp.get("ok"):
+                    self.registered = False
+                    self.probe_and_register()
+                elif self.do_bench and (time.time() - self.last_bench_at) > self.rebench_interval:
+                    run_floor_benchmarks()
+                    self.last_bench_at = time.time()
+                    self._post("/api/heartbeat", {"node_id": self.node_id})
+                time.sleep(HEARTBEAT_SECONDS)
+        finally:
+            if watcher is not None:
+                watcher.stop()
+
+    def _on_devices_changed(self, added: list, removed: list) -> None:
+        """New or removed hardware => re-register (idempotent upsert) so the
+        hub's coverage view picks it up. Debounced trivially by the watcher's
+        interval; full_probe re-runs are cheap on known machines."""
+        time.sleep(2.0)
+        self.probe_and_register()
 
     def run_once(self) -> bool:
         return self.probe_and_register()

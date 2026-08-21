@@ -14,6 +14,24 @@ from typing import List, Optional
 from .queue import WorkQueue
 from .registry import Registry
 
+
+def _uncovered_rows(registry: Registry) -> List[str]:
+    try:
+        from .coverage import coverage_report
+
+        report = coverage_report(registry)
+    except Exception:
+        return ['<tr><td colspan="3" class="none">coverage unavailable</td></tr>']
+    rows = []
+    for dev in report["uncovered"]:
+        rows.append(
+            '<tr><td class="mono">' + html.escape(dev["device_class"]) + "</td>"
+            "<td>" + html.escape(dev["hostname"]) + "</td>"
+            '<td class="warn">no proven adapter — queued for the integrator (M4)</td></tr>'
+        )
+    return rows
+
+
 STYLE = """
 body{background:#0f1215;color:#dde2e7;font:14px/1.5 'Segoe UI',system-ui,sans-serif;margin:0;padding:32px}
 h1{font-size:20px;letter-spacing:.02em;border-bottom:2px solid #3cc492;padding-bottom:8px}
@@ -179,6 +197,13 @@ def render_dashboard(registry: Registry, queue: Optional[WorkQueue] = None) -> s
             for b in bags
         )
         or '<tr><td colspan="6" class="none">No open bags. Submit: POST /api/bag/submit</td></tr>'
+    }
+</table>
+<h2>Uncovered devices</h2>
+<table><tr><th>Class</th><th>Host</th><th>Status</th></tr>
+{
+        "".join(_uncovered_rows(registry))
+        or '<tr><td colspan="3" class="none">all sensed devices have proven adapters (or none sensed yet)</td></tr>'
     }
 </table>
 <h2>Anomalies</h2>
