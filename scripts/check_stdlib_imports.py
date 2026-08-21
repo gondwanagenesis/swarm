@@ -16,7 +16,70 @@ import sys
 from pathlib import Path
 from typing import List, Set
 
-ALLOWED_EXTRA = {"swarm"}
+ALLOWED_EXTRA = {"swarm", "__future__"}
+
+# Baseline for interpreters without sys.stdlib_module_names (<3.10); unioned
+# everywhere so behaviour is identical across the CI matrix.
+BASELINE = {
+    "__future__",
+    "os",
+    "sys",
+    "json",
+    "re",
+    "io",
+    "time",
+    "math",
+    "socket",
+    "struct",
+    "subprocess",
+    "threading",
+    "http",
+    "urllib",
+    "pathlib",
+    "typing",
+    "dataclasses",
+    "enum",
+    "hashlib",
+    "uuid",
+    "sqlite3",
+    "statistics",
+    "platform",
+    "shutil",
+    "importlib",
+    "ctypes",
+    "glob",
+    "argparse",
+    "contextlib",
+    "collections",
+    "functools",
+    "itertools",
+    "abc",
+    "copy",
+    "datetime",
+    "errno",
+    "inspect",
+    "logging",
+    "numbers",
+    "operator",
+    "queue",
+    "random",
+    "secrets",
+    "select",
+    "selectors",
+    "signal",
+    "ssl",
+    "string",
+    "tempfile",
+    "textwrap",
+    "traceback",
+    "types",
+    "unittest",
+    "warnings",
+    "weakref",
+    "xml",
+    "zipfile",
+    "zlib",
+}
 
 
 def imported_roots(path: Path) -> Set[str]:
@@ -33,37 +96,7 @@ def imported_roots(path: Path) -> Set[str]:
 
 def main(argv: List[str]) -> int:
     stdlib = set(getattr(sys, "stdlib_module_names", set()))
-    if not stdlib:
-        stdlib = {
-            "os",
-            "sys",
-            "json",
-            "re",
-            "io",
-            "time",
-            "math",
-            "socket",
-            "struct",
-            "subprocess",
-            "threading",
-            "http",
-            "urllib",
-            "pathlib",
-            "typing",
-            "dataclasses",
-            "enum",
-            "hashlib",
-            "uuid",
-            "sqlite3",
-            "statistics",
-            "platform",
-            "shutil",
-            "importlib",
-            "ctypes",
-            "glob",
-            "argparse",
-        }
-    allowed = stdlib | ALLOWED_EXTRA
+    allowed = stdlib | BASELINE | ALLOWED_EXTRA
     failures = []
     for root in argv[1:]:
         root_path = Path(root)
