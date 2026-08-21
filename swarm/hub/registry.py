@@ -86,6 +86,14 @@ CREATE TABLE IF NOT EXISTS device_verdicts (
     at REAL,
     PRIMARY KEY (node_id, device_class)
 );
+CREATE TABLE IF NOT EXISTS gate_runs (
+    gate_run_id TEXT PRIMARY KEY,
+    adapter_id TEXT,
+    device_class TEXT,
+    passed INTEGER,
+    detail_json TEXT,
+    at REAL
+);
 """
 
 
@@ -295,6 +303,37 @@ class Registry:
     def list_verdicts(self) -> List[Dict[str, Any]]:
         rows = self._conn.execute("SELECT * FROM device_verdicts ORDER BY at DESC").fetchall()
         return [dict(r) for r in rows]
+
+    @synchronized
+    def record_gate_run(self, record: Dict[str, Any]) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO gate_runs (gate_run_id, adapter_id, device_class, passed, detail_json, at) VALUES (?,?,?,?,?,?)",
+            (
+                record.get("gate_run_id"),
+                record.get("adapter_id"),
+                record.get("device_class"),
+                int(bool(record.get("passed"))),
+                json.dumps(record, sort_keys=True),
+                record.get("at", time.time()),
+            ),
+        )
+        self._conn.commit()
+
+    @synchronized
+    def list_gate_runs(self, limit: int = 50) -> List[Dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT gate_run_id, adapter_id, device_class, passed, at FROM gate_runs ORDER BY at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    @synchronized
+    def promote_adapter(self, adapter_id: str, gate_run_id: str) -> None:
+        self._conn.execute(
+            "UPDATE adapters SET gate_run_id=? WHERE adapter_id=?",
+            (gate_run_id, adapter_id),
+        )
+        self._conn.commit()
 
     @synchronized
     def list_bindings(self) -> List[Dict[str, Any]]:

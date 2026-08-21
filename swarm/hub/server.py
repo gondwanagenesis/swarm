@@ -224,6 +224,20 @@ class Hub:
                             float(payload.get("lease_seconds") or 60.0),
                         )
                         self._send_json({"ok": True, "renewed": renewed})
+                    elif path == "/api/integrator/synthesize":
+                        payload = self._read_json()
+                        contract_name = str(payload.get("contract") or "prime_contract.json")
+                        try:
+                            from ..integrator.gate import load_contract
+                            from ..integrator.llm import LlmClient
+                            from ..integrator.synthesize import SynthesisLoop
+
+                            contract = load_contract(contract_name)
+                            loop = SynthesisLoop(hub.registry, LlmClient(hub.llm_config), contract)
+                            out = loop.run()
+                            self._send_json({"ok": bool(out.get("passed")), **out})
+                        except FileNotFoundError:
+                            self._bad(f"unknown contract {contract_name}")
                     else:
                         self._send_json({"ok": False, "error": "not found"}, status=404)
                 except ValueError as exc:

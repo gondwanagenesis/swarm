@@ -1,0 +1,21 @@
+{
+  "name": "cpu-prime-count-v1",
+  "device_class": "cpu:generic",
+  "op": "primesum",
+  "description": "Reference contract for prime counting. A hand-written contract used to prove the gate itself before any synthesized adapter is trusted. Every contract ships a known-good and a known-bad; the gate must accept the good and reject the bad.",
+  "cases": [
+    {"input": {"n": 10}, "expected": 4, "note": "2,3,5,7"},
+    {"input": {"n": 100}, "expected": 25},
+    {"input": {"n": 1000}, "expected": 168},
+    {"input": {"n": 5000}, "expected": 669}
+  ],
+  "known_good": {
+    "type": "python",
+    "source": "def primes(n):\n    def is_p(k):\n        if k < 2: return False\n        if k == 2: return True\n        if k % 2 == 0: return False\n        d = 3\n        while d*d <= k:\n            if k % d == 0: return False\n            d += 2\n        return True\n    return [p for p in range(2, n) if is_p(p)]\n"
+  },
+  "known_bad": {
+    "type": "python",
+    "source": "def primes(n):\n    return list(range(2, n, 2))\n",
+    "reason": "returns evens, not primes — must be rejected"
+  }
+}
