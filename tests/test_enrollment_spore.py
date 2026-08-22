@@ -114,7 +114,9 @@ def test_watcher_fires_on_interface_change(monkeypatch):
     watcher = AttachmentWatcher(poll_s=0.05)
     watcher.on_attach(lambda channel, hint: fired.append((channel, hint)))
     thread = watcher.start()
-    time.sleep(0.1)
+    settle_by = time.time() + 2.0
+    while watcher._ifaces == [] and time.time() < settle_by:
+        time.sleep(0.02)
     state["ifaces"].append("rndis0")
     deadline = time.time() + 4.0
     while not fired and time.time() < deadline:

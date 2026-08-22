@@ -79,11 +79,15 @@ class Hub:
             autopilot=autopilot_env not in ("0", "false", "no"),
         )
         self.agent_payload: Optional[bytes] = None
+        self.latest_bundle_hash: Optional[str] = None
         self.started_at = time.time()
         self._httpd = None
 
     def set_agent_payload(self, payload: bytes) -> None:
+        import hashlib
+
         self.agent_payload = payload
+        self.latest_bundle_hash = hashlib.sha256(payload).hexdigest()
 
     def make_handler(self) -> type:
         hub = self
@@ -133,6 +137,17 @@ class Hub:
                     path = self.path.split("?", 1)[0]
                     if path == "/api/ping":
                         self._send_json({"ok": True, "ts": time.time()})
+                    elif path == "/api/bundle/latest":
+                        if hub.agent_payload is None:
+                            self._send_json({"ok": False, "error": "no bundle"}, status=404)
+                        else:
+                            body = hub.agent_payload
+                            self.send_response(200)
+                            self.send_header("Content-Type", "application/octet-stream")
+                            self.send_header("X-Bundle-SHA256", hub.latest_bundle_hash or "")
+                            self.send_header("Content-Length", str(len(body)))
+                            self.end_headers()
+                            self.wfile.write(body)
                     elif path == "/api/config":
                         self._send_json(
                             {
@@ -350,15 +365,23 @@ class Hub:
                             str(payload.get("peer_hint", "")),
                         )
                         self._send_json({"ok": True})
-                    elif path == "/api/tasks/renew":
+                    elif path == "/api/sharpen":
                         payload = self._read_json()
-                        renewed = hub.queue.renew(
-                            str(payload.get("node_id", "")),
-                            str(payload.get("bag_id", "")),
-                            [int(s) for s in (payload.get("seqs") or [])],
-                            float(payload.get("lease_seconds") or 60.0),
-                        )
-                        self._send_json({"ok": True, "renewed": renewed})
+                        hub.handle_sharpen(payload)
+                        self._send_json({"ok": True})
+                    elif path == "/api/self-update":
+                        payload = self._read_json()
+                        if hub.latest_bundle_hash is None:
+                            self._send_json({"ok": False, "error": "no bundle available"})
+                        else:
+                            self._send_json(
+                                {
+                                    "ok": True,
+                                    "sha256": hub.latest_bundle_hash,
+                                    "url": "/api/bundle/latest",
+                                    "size": len(hub.agent_payload or b""),
+                                }
+                            )
                     elif path == "/api/integrator/synthesize":
                         payload = self._read_json()
                         contract_name = str(payload.get("contract") or "prime_contract.json")
@@ -541,6 +564,31 @@ a.btn{{display:inline-block;background:#3cc492;color:#0f1215;padding:12px 24px;b
             return {"ok": False, "error": f"unknown action {action!r}"}
         return {"ok": True, **self.brain.status()}
 
+    def handle_sharpen(self, payload: Dict[str, Any]) -> None:
+        """A node finished an idle-hone rung; fold fresh measurements into the
+        registry. Pilot scores land as a low-trust bench so confidence grows
+        with volume."""
+        from ..core.models import BenchResult, MeasurementTrust
+
+        node_id = str(payload.get("node_id") or "")
+        if not node_id:
+            return
+        pilot = payload.get("pilot") or {}
+        score = pilot.get("score_gflops")
+        if score is not None:
+            self.registry.record_bench(
+                node_id,
+                BenchResult(
+                    name="cpu_fp32_gflops",
+                    value=float(score),
+                    unit="GFLOPS",
+                    trust=MeasurementTrust.FALLBACK,
+                    benchmark_run_id="sharpen-" + str(int(time.time())),
+                ),
+            )
+        for b in payload.get("benchmarks") or []:
+            self.registry.record_bench(node_id, from_dict(BenchResult, b))
+
     def serve_forever(self) -> Tuple[str, int]:
         handler = self.make_handler()
         self._httpd = ThreadingHTTPServer((self.host, self.port), handler)
@@ -569,21 +617,31 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Swarm hub")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8777)
-    parser.add_argument("--db", default=":memory:", help="sqlite path (default in-memory)")
+    parser.add_argument(
+        "--db",
+        default=None,
+        help="sqlite path; default ~/.swarm/hub.db (pass ':memory:' for ephemeral)",
+    )
     parser.add_argument(
         "--serve-agent",
         action="store_true",
         help="build and serve the single-file agent at /agent.pyz",
     )
     args = parser.parse_args()
-    hub = Hub(host=args.host, port=args.port, db_path=args.db)
+    if args.db is None:
+        state_dir = Path.home() / ".swarm"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        db = str(state_dir / "hub.db")
+    else:
+        db = args.db
+    hub = Hub(host=args.host, port=args.port, db_path=db)
     if args.serve_agent:
         from .agentbundle import build_agent_pyz
 
         payload = build_agent_pyz()
         hub.set_agent_payload(payload)
         print(f"agent bundle ready at /agent.pyz ({len(payload)} bytes)")
-    print(f"swarm hub listening on http://{args.host}:{args.port} (dashboard at /)")
+    print(f"swarm hub listening on http://{args.host}:{args.port} (dashboard at /, db={db})")
     try:
         hub.serve_forever()
     except KeyboardInterrupt:

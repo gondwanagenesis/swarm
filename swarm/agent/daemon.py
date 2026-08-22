@@ -70,6 +70,7 @@ class Agent:
         token: Optional[str] = None,
         role: str = "node",
         ignore_welfare: bool = False,
+        self_update: bool = False,
     ) -> None:
         parsed = urlparse(hub_url if "://" in hub_url else "http://" + hub_url)
         self.hub_host = parsed.hostname or "127.0.0.1"
@@ -83,6 +84,7 @@ class Agent:
         self.node_id = ""
         self.last_bench_at = 0.0
         self.ignore_welfare = ignore_welfare
+        self.self_update = self_update
         self._stop = threading.Event()
 
     def _post(self, path: str, payload: Dict[str, Any], timeout: float = 10.0) -> Optional[Dict[str, Any]]:
@@ -214,6 +216,17 @@ class Agent:
             "</body></html>"
         )
         threading.Thread(target=serve, args=(page,), daemon=True, name="swarm-seed-serve").start()
+        from .mdns import announce
+
+        def announce_loop() -> None:
+            while not self._stop.is_set():
+                try:
+                    announce(f"seed-{(self.node_id or 'unknown')[:12]}._swarm._tcp.local")
+                except Exception:
+                    continue
+                self._stop.wait(60.0)
+
+        threading.Thread(target=announce_loop, daemon=True, name="swarm-seed-mdns").start()
         while not self._stop.is_set():
             time.sleep(1.0)
         watcher.stop()
@@ -279,6 +292,7 @@ class Agent:
 
         idle = 0.0
         blocked_logged = False
+        hone = None
         while not self._stop.is_set():
             if not self.ignore_welfare:
                 welfare = welfare_gate()
@@ -292,6 +306,26 @@ class Agent:
             resp = self._post("/api/tasks/pull", {"node_id": self.node_id})
             tasks = (resp or {}).get("tasks") or []
             if not tasks:
+                # idle rung: burn spare cycles on self-knowledge, not tokens
+                from .idle import IdleHone
+
+                if hone is None:
+                    hone = IdleHone(self.node_id)
+                try:
+                    report = hone.sharpen(self)
+                    if report.get("ran"):
+                        print(f"[idle] sharpened: {report['ran']}", flush=True)
+                except Exception:
+                    pass
+                if self.self_update:
+                    from .updater import apply_update
+
+                    try:
+                        outcome = apply_update(f"http://{self.hub_host}:{self.hub_port}")
+                        if outcome not in ("current", "no-offer"):
+                            print(f"[update] {outcome}", flush=True)
+                    except Exception as exc:
+                        print(f"[update] failed safely: {exc}", flush=True)
                 idle = min(IDLE_BACKOFF_MAX, idle * 2 + poll_seconds)
                 time.sleep(min(idle, poll_seconds))
                 continue
@@ -327,6 +361,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="spore mode: probe-lite, watch for attached devices, serve the one-click invite page",
     )
+    parser.add_argument(
+        "--self-update",
+        action="store_true",
+        help="poll hub for updated agent bundles and hot-swap when offered",
+    )
     args = parser.parse_args(argv)
 
     agent = Agent(
@@ -334,6 +373,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         bench=not args.no_bench,
         token=args.token,
         role="seed" if args.seed else "node",
+        self_update=args.self_update,
     )
     t0 = time.time()
     ok = agent.probe_and_register()

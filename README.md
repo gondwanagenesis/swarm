@@ -1,5 +1,7 @@
 # Swarm
 
+> Next builder: **`HANDOFF.md`** — the full map, the laws, the footguns.
+
 **A spreading cloud of compute. A superorganism, not a scheduler.**
 
 Plug any machine in and it becomes tissue. The swarm senses it the way a
