@@ -71,9 +71,12 @@ stated. Nothing here is marked proven because it looked right.
 | Collective motion (M6) | **Not started** | Multi-model packing, adaptive replication. |
 
 **The honest summary:** the scheduling and measurement organism is real and
-proven under failure. The compute it schedules is, today, CPU work plus a
-GPU path that no machine here could exercise. That gap is the next milestone,
-not a footnote.
+proven under failure, and it now schedules real work — live model inference,
+routed to nodes that actually have the runtime. What it still cannot do is
+*accelerate* that work on a GPU (the path is written; no machine here has a
+bound GPU runtime to run it) or execute a model too large for one node (the
+partitioner is exact; the executor does not exist). Those two gaps are the
+next milestones, not footnotes.
 
 ## RSSI of the organism (the fuel gauge)
 
