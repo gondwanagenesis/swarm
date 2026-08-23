@@ -29,6 +29,7 @@ from ..probe.discovery import discover_runtimes
 from ..probe.hotplug import HotplugWatcher
 from ..probe.orchestrator import full_probe
 from ..transport.link import LinkProber
+from .adapter_runtime import run_spec, task_adapter_spec
 from .ops import OPS
 
 HEARTBEAT_SECONDS = 30.0
@@ -242,7 +243,12 @@ class Agent:
 
     def execute_chunk(self, tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Run one leased chunk. Each item is timed for the hub's EWMA;
-        a failing op marks that item failed but never kills the chunk."""
+        a failing op marks that item failed but never kills the chunk.
+
+        An op the registry doesn't know is not automatically a failure: the
+        task may carry an adapter (source or id), which runs through
+        `adapter_runtime` in its own subprocess. An unknown op with no
+        adapter still fails closed, exactly as before."""
         results: List[Dict[str, Any]] = []
         for task in tasks:
             op = OPS.get(task.get("op") or "")
@@ -255,6 +261,12 @@ class Agent:
                     ok = True
                 except Exception as exc:
                     payload = {"error": str(exc)[:200]}
+            else:
+                spec = task_adapter_spec(task)
+                if spec is not None:
+                    outcome = run_spec(spec)  # never raises
+                    ok = bool(outcome.get("ok"))
+                    payload = outcome
             results.append(
                 {
                     "bag_id": task["bag_id"],
@@ -350,7 +362,17 @@ class Agent:
 def main(argv: Optional[List[str]] = None) -> int:
     cfg = bundled_config()
     parser = argparse.ArgumentParser(description="Swarm node agent")
-    parser.add_argument("--hub", default=cfg.get("hub", "http://127.0.0.1:8777"))
+    parser.add_argument(
+        "--hub",
+        default=cfg.get("hub"),
+        help="hub base URL; omit to discover one on the LAN over mDNS",
+    )
+    parser.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=5.0,
+        help="seconds to look for a hub on the LAN when --hub is not given",
+    )
     parser.add_argument("--token", default=cfg.get("token"))
     parser.add_argument("--no-bench", action="store_true", help="probe only, skip benchmarks")
     parser.add_argument("--once", action="store_true", help="register once and exit")
@@ -368,8 +390,28 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    # No --hub given: look for one on the LAN before falling back to the
+    # loopback default. Discovery only ever yields a CANDIDATE address —
+    # joining still goes through the token/consent path, so finding a hub is
+    # not the same as being recruited by one (AGENTS.md: no self-propagation).
+    hub_url = args.hub
+    if not hub_url:
+        from .discovery_loop import discover_hub
+
+        found = discover_hub(args.discover_timeout)
+        if found:
+            hub_url = found
+            print(f"agent: discovered hub on the LAN at {hub_url}")
+        else:
+            hub_url = "http://127.0.0.1:8777"
+            print(
+                f"agent: no hub found on the LAN in {args.discover_timeout:.0f}s; "
+                f"falling back to {hub_url}",
+                file=sys.stderr,
+            )
+
     agent = Agent(
-        hub_url=args.hub,
+        hub_url=hub_url,
         bench=not args.no_bench,
         token=args.token,
         role="seed" if args.seed else "node",
@@ -380,7 +422,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     elapsed = time.time() - t0
     if not ok:
         print(
-            f"agent: probe ok but hub unreachable at {args.hub}; will retry in background loop",
+            f"agent: probe ok but hub unreachable at {hub_url}; will retry in background loop",
             file=sys.stderr,
         )
     else:

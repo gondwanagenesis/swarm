@@ -100,7 +100,14 @@ The organism heals itself the way it earns trust: by proof, not permission.
 - **M3 (done):** hedging (75%-claimed + 1.5x median elapsed, max 1/task), tiers earned from track record, suspension rail (3 strikes), failure attribution in the sweep.
 - **M4 (done):** Tier-0 discovery first (existing runtimes over new code); pilot sniff; worth-it gate (adopt_now / synthesize / park WITH reasons); contract gate proven on hand-written code first, calibration fields included; LLM synthesis (provider-agnostic; NeuralWatt via env) gated and budget-capped; trial/promotion recorded with provenance hash.
 - **M4.5 (done):** enrollment tokens + one-click invite + per-invite bundled agent; welfare/politeness loop (battery, user-idle); spore/seed posture with attachment watch (interface + adb diff), zero-click on authorized fleet, one-click for strangers. The seed never self-installs.
-- **M5 (scaffold):** pipeline planner that maps stages to measured free memory, fails closed. Behavioral model execution with real adapters lands next — with the idle-honing loop deepening measurements in the background.
+- **M4.75 (done):** the compute-fabric pass. Adapter source persisted and
+  retrievable (a gate pass that discards the code proves nothing); the gate is
+  contract-driven and subprocess-isolated; `device_class` routing from measured
+  profiles; LAN discovery wired so `--hub` is optional. See HANDOFF.md.
+- **M5 (planner done, execution absent):** exact DP contiguous-chain min-max
+  partition over measured free memory, reporting bottleneck and latency
+  separately, failing closed. It does **not** execute a model — no weights, no
+  tensor transport. Behavioral runs on gated adapters land next.
 - **M6:** multi-model packing, small-model fine-tuning, adaptive replication.
 
 Do not build M4 features while M2/M3 invariants are untested.

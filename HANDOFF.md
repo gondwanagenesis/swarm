@@ -103,6 +103,50 @@ lowest honest lane and *says so*.
 Gates before every push: `pytest tests/`, `ruff check`, stdlib import gate,
 `compileall`.
 
+## The compute-fabric pass (what changed and why)
+
+An audit found the scheduling organism real and the *compute* it schedules
+largely absent. Six gaps, all now closed except where hardware prevented it:
+
+1. **Adapter source was discarded.** The `adapters` table had no source
+   column and `record_adapter` never received the code — a "proven adapter"
+   was a hash pointing at nothing, and nothing could ever load one. Now:
+   `hub/adapter_store.py` (content-addressed, atomic, sharded), a `source_hash`
+   column added by migration, and `get_adapter_source()`. Pinned end to end by
+   `tests/test_adapter_lifecycle.py`: retrieved source still executes *and*
+   still re-passes the gate.
+2. **The gate checked the wrong thing.** `entrypoint` was the string literal
+   `"primes"` and comparison was `len(out) == expected`, so an adapter
+   returning `list(range(4))` for n=10 passed. Now entrypoint/comparison/
+   timeout come from the contract (`length`/`exact`/`allclose`), and
+   `prime_contract.json` v2 compares actual prime *lists*.
+3. **The gate was not a boundary.** Restricted-`__builtins__` `exec` in the
+   hub process is a well-known non-boundary. Now a `subprocess` with a hard
+   timeout, JSON over stdin/stdout, and a per-run uuid4 stdout marker so an
+   `atexit` hook cannot forge a pass.
+4. **No hardware routing.** Bags had no `device_class`. Now schema v3 plus
+   `node_device_classes`, populated at registration from the node's *measured*
+   profile at two granularities (`nvidia:geforce_rtx_4090` and `gpu:generic`).
+5. **mDNS announced into a void.** `parse_response`/`send_query` had no
+   production caller. Now `agent/discovery_loop.py` browses, resolves
+   PTR+SRV+A, and `--hub` is optional. Also fixed a latent infinite loop in
+   `_decode_name` on self-referential compression pointers — harmless while
+   nothing listened, a thread-killer once real LAN packets arrive.
+6. **M5 summed stage times.** Pipeline throughput is the *bottleneck*, not the
+   sum, and the greedy loop piled every stage on the biggest node. Now an
+   exact DP contiguous-chain min-max partition reporting `bottleneck_ms` and
+   `latency_ms` separately.
+
+Two bugs the demo caught that unit tests could not, both now pinned:
+`handle_submit` dropped `device_class` (so every classed bag submitted over
+HTTP — the only path real agents use — silently became unrestricted), and
+`start_lan_announce` read `self.port` before bind, advertising port 0.
+
+**Still unproven, and honestly labelled:** the `torch_cuda` matmul tier has
+never executed — this machine has an Intel Iris Xe with `runtimes=[]` and
+`torch 2.13.0+cpu`. Adapter synthesis has never run against a live LLM. M5
+still does not execute a model. Do not mark any of these done without a run.
+
 ## Hard-hat areas (rough drafts — honest labels)
 
 - `swarm/hub/pipeline.py` — M5 *scaffold*. Stage→node mapping on measured free

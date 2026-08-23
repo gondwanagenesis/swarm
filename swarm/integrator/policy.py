@@ -14,6 +14,8 @@ Every routing decision is recorded with its lane and why.
 
 from __future__ import annotations
 
+import contextlib
+import sqlite3
 import time
 from typing import Any, Dict, Optional
 
@@ -108,9 +110,53 @@ class BrainRouter:
         self.sensitivity = max(0.0, min(1.0, value))
         self._save_state()
 
-    def route(self, task_difficulty: float, has_local: bool = True) -> Dict[str, Any]:
+    @staticmethod
+    def estimate_difficulty(
+        contract: Dict[str, Any],
+        prior_failures: int = 0,
+        has_exemplar: bool = False,
+    ) -> float:
+        """Estimate how hard a synthesis task is, from the contract itself.
+
+        This is a HEURISTIC, not a measurement, and it is labelled as such
+        wherever it surfaces — the swarm does not dress an estimate up as a
+        benchmark. It exists because the alternative in place was a hardcoded
+        constant, which meant every request escalated to the frontier lane
+        regardless of difficulty.
+
+        The signals are the ones with evidence behind them:
+        - no exemplar is the single largest correctness predictor
+          (7-17% without a reference vs 55-63% with one), so it dominates
+        - each gate rejection is direct evidence this task is harder than
+          the last estimate assumed
+        - elementwise/numeric comparison is a stricter bar than a count
+        """
+        score = 0.35
+        if not has_exemplar:
+            score += 0.30
+        compare = str(contract.get("compare", "length")).lower()
+        score += {"length": 0.0, "exact": 0.08, "allclose": 0.15}.get(compare, 0.08)
+        n_cases = len(contract.get("cases") or [])
+        if n_cases >= 8:
+            score += 0.08
+        elif n_cases >= 4:
+            score += 0.04
+        # Each failed attempt is measured evidence, not a guess.
+        score += min(0.25, 0.08 * max(0, prior_failures))
+        return max(0.0, min(1.0, score))
+
+    def route(
+        self,
+        task_difficulty: float,
+        has_local: bool = True,
+        difficulty_source: str = "caller",
+    ) -> Dict[str, Any]:
         """Never returns lane 2 unless: enabled, not kill-switched, escalation
-        required by difficulty, and the frontier config is armed."""
+        required by difficulty, and the frontier config is armed.
+
+        `difficulty_source` is recorded with the decision so an auditor can
+        tell an estimated difficulty from one a caller asserted.
+        """
         difficulty = max(0.0, min(1.0, task_difficulty))
         if self.enabled and not self.kill_switch and difficulty > self.sensitivity and self.frontier.armed:
             lane = LANE_FRONTIER
@@ -122,6 +168,7 @@ class BrainRouter:
             "lane": lane,
             "lane_name": LANE_NAMES[lane],
             "difficulty": difficulty,
+            "difficulty_source": difficulty_source,
             "sensitivity": self.sensitivity,
             "frontier_enabled": self.enabled,
             "kill_switch": self.kill_switch,
@@ -134,12 +181,25 @@ class BrainRouter:
         self.registry._conn.execute(
             "CREATE TABLE IF NOT EXISTS brain_routes (id INTEGER PRIMARY KEY AUTOINCREMENT, lane INTEGER, lane_name TEXT, difficulty REAL, sensitivity REAL, frontier_enabled INTEGER, kill_switch INTEGER, at REAL)"
         )
+        # Older hubs have this table without difficulty_source. Add it in
+        # place so an existing routing ledger keeps its history.
+        cols = {
+            row[1]
+            for row in self.registry._conn.execute("PRAGMA table_info(brain_routes)")
+        }
+        if "difficulty_source" not in cols:
+            with contextlib.suppress(sqlite3.OperationalError):
+                self.registry._conn.execute(
+                    "ALTER TABLE brain_routes ADD COLUMN difficulty_source TEXT"
+                )
         self.registry._conn.execute(
-            "INSERT INTO brain_routes (lane, lane_name, difficulty, sensitivity, frontier_enabled, kill_switch, at) VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO brain_routes (lane, lane_name, difficulty, difficulty_source,"
+            " sensitivity, frontier_enabled, kill_switch, at) VALUES (?,?,?,?,?,?,?,?)",
             (
                 decision["lane"],
                 decision["lane_name"],
                 decision["difficulty"],
+                decision.get("difficulty_source", "caller"),
                 decision["sensitivity"],
                 int(decision["frontier_enabled"]),
                 int(decision["kill_switch"]),
