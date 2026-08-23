@@ -554,6 +554,12 @@ a.btn{{display:inline-block;background:#3cc492;color:#0f1215;padding:12px 24px;b
         from .coverage import device_class
 
         classes = {"cpu:generic"}
+        # Runtime classes the node reported discovering (e.g. runtime:ollama).
+        # Reported by the agent's own probe, so it is a measured finding about
+        # that machine — not a hub-side guess about what it might have.
+        for runtime in getattr(profile, "runtimes", None) or []:
+            if runtime:
+                classes.add("runtime:{}".format(str(runtime).strip().lower()))
         for dev in getattr(profile, "devices", None) or []:
             vendor = getattr(dev, "vendor", None)
             name = getattr(dev, "name", None)

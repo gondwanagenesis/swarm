@@ -28,7 +28,11 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import importlib
+import json
 import math
+import os
+import time
+import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 Matrix = List[List[int]]
@@ -264,6 +268,103 @@ def matmul_tiers_available() -> List[str]:
     return out
 
 
+OLLAMA_DEFAULT_URL = "http://127.0.0.1:11434"
+
+
+def _ollama_url() -> str:
+    """Where this node's local inference runtime lives, if anywhere."""
+    return (os.environ.get("SWARM_OLLAMA_URL") or OLLAMA_DEFAULT_URL).rstrip("/")
+
+
+def embed_runtime_available(timeout: float = 2.0) -> Optional[Dict[str, Any]]:
+    """Probe for a local embedding runtime. Returns its facts, or None.
+
+    Discovery, not declaration (Law 3): we ask the runtime what it has rather
+    than trusting a config. `None` means this node cannot serve embeddings —
+    which is a fine answer, and better than a fabricated vector.
+    """
+    try:
+        with urllib.request.urlopen(_ollama_url() + "/api/tags", timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+    models = [
+        m.get("name")
+        for m in (data.get("models") or [])
+        if "embedding" in (m.get("capabilities") or [])
+    ]
+    if not models:
+        return None
+    return {"runtime": "ollama", "url": _ollama_url(), "models": sorted(models)}
+
+
+def op_embed(params: Dict[str, Any]) -> Any:
+    """Embed text with a local model. Real inference, not a synthetic grind.
+
+    Deterministic for a given (model, text), which is what idempotency and
+    content-addressed results actually require — the same task re-run on
+    another node yields the same vector, so a lease expiry is still safe.
+
+    Fails CLOSED: a node with no embedding runtime raises rather than
+    returning zeros. A plausible-looking vector that no model produced is
+    exactly the lie this system exists to not tell.
+
+    Params:
+      text        the string to embed (required)
+      model       model name; defaults to the first embedding model present
+      dims_only   return only the dimensionality + checksum, not the vector
+    """
+    text = params.get("text")
+    if not isinstance(text, str) or not text:
+        raise ValueError("embed requires a non-empty 'text' param")
+
+    facts = embed_runtime_available()
+    if facts is None:
+        raise RuntimeError(
+            "no local embedding runtime on this node "
+            "(looked for an Ollama embedding model at {})".format(_ollama_url())
+        )
+    model = str(params.get("model") or facts["models"][0])
+    if model not in facts["models"]:
+        raise RuntimeError(
+            "model {!r} not present here; this node has {}".format(model, facts["models"])
+        )
+
+    body = json.dumps({"model": model, "prompt": text}).encode("utf-8")
+    req = urllib.request.Request(
+        facts["url"] + "/api/embeddings",
+        data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    started = time.perf_counter()
+    with urllib.request.urlopen(req, timeout=float(params.get("timeout", 120.0))) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    elapsed = time.perf_counter() - started
+
+    vector = payload.get("embedding")
+    if not isinstance(vector, list) or not vector:
+        raise RuntimeError("embedding runtime returned no vector")
+
+    checksum = hashlib.sha256(
+        json.dumps([round(float(v), 6) for v in vector]).encode("utf-8")
+    ).hexdigest()[:16]
+    out: Dict[str, Any] = {
+        "op": "embed",
+        "model": model,
+        "dims": len(vector),
+        "checksum": checksum,
+        "chars": len(text),
+        # Attribution (Law 5): which runtime actually produced this.
+        "tier": "ollama_local",
+        "device": "runtime:ollama",
+        "backend": facts["runtime"],
+        "elapsed_s": round(elapsed, 4),
+    }
+    if not params.get("dims_only"):
+        out["embedding"] = vector
+    return out
+
+
 def op_matmul(params: Dict[str, Any]) -> Any:
     """Dense integer matmul, C = A @ B. Pure function of its params.
 
@@ -374,4 +475,5 @@ OPS: Dict[str, Callable[[Dict[str, Any]], Any]] = {
     "primesum": op_primesum,
     "hashwork": op_hashwork,
     "matmul": op_matmul,
+    "embed": op_embed,
 }

@@ -64,6 +64,7 @@ stated. Nothing here is marked proven because it looked right.
 | Consent membrane (M4.5) | **Proven** | Enrollment tokens, one-click invite, per-invite bundle. Discovery finds candidates; it never enrolls. |
 | Welfare loop | **Proven** | Backs off on typing / battery; demos must opt out explicitly and loudly. |
 | Gene expression (workshop) | **Proven** | Self-edits only through a sandboxed gate; every byte content-hashed; rollback restores exact bytes. |
+| Real workloads | **Proven** | `embed` runs a live local model (bge-m3, 1024-dim) and is deterministic per (model, text), so idempotency and content addressing hold. Fails closed with no runtime — never a synthetic vector. |
 | Accelerated compute (GPU tier) | **Built, unproven here** | `matmul` degrades torch-CUDA → numpy/BLAS → torch-CPU → pure Python and **reports which tier actually ran**. This machine has an Intel Iris Xe with no bound runtime and CPU-only torch, so the CUDA path has never executed. It needs a CUDA box to earn "proven". |
 | Adapter synthesis (M4 Tier 1) | **Built, unproven here** | Loop, budget cap, and promotion-only-after-gate are wired and tested against scripted LLMs. No run against a live model has been recorded. |
 | The teeth (M5) | **Planner proven, execution absent** | Exact DP contiguous-chain min-max partition; reports `bottleneck_ms` and `latency_ms` separately. It **does not run models** — no weights, no tensor transport. |
