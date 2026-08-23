@@ -82,6 +82,70 @@ class Hub:
         self.latest_bundle_hash: Optional[str] = None
         self.started_at = time.time()
         self._httpd = None
+        self._mdns_stop: Optional[Any] = None  # threading.Event once LAN mode is on
+        self._mdns_thread: Optional[Any] = None
+        self.advertised_url: Optional[str] = None
+
+    # -- LAN discovery ----------------------------------------------------
+
+    def start_lan_announce(
+        self, address: Optional[str] = None, interval: float = 60.0
+    ) -> Optional[str]:
+        """Announce this hub over mDNS so agents on the LAN can find it.
+
+        Opt-in only — never called by ``__init__``. Advertises the *reachable*
+        address (never loopback) so a discovered instance resolves to something
+        another machine can actually connect to. Returns the advertised base
+        URL, or ``None`` when no LAN address could be determined.
+
+        Announcing is not recruiting: agents that discover this hub still have
+        to enroll through the token/consent path (AGENTS.md, no self-propagation).
+        """
+        import threading
+
+        from ..agent.mdns import (
+            HUB_PREFIX,
+            announce,
+            instance_name,
+            primary_ip,
+        )
+
+        ip = address or primary_ip()
+        if not ip:
+            return None
+        # self.port is only the REAL port after the socket binds (serve_forever
+        # / start_background overwrite it). With Hub(port=0) an early caller
+        # would otherwise advertise port 0, which resolves to nothing.
+        port = int(self.port)
+        if self._httpd is not None:
+            with contextlib.suppress(Exception):
+                port = int(self._httpd.server_address[1])
+        if not port:
+            # Advertising an unbound hub is advertising a lie. Say nothing.
+            return None
+        node = getattr(self.registry, "hub_id", None) or "{}".format(port)
+        instance = instance_name(HUB_PREFIX, str(node))
+        host = "swarm-hub-{}.local".format(str(node)[:12])
+        stop = threading.Event()
+        self._mdns_stop = stop
+
+        def announce_loop() -> None:
+            while not stop.is_set():
+                # A blocked multicast network is not a hub failure.
+                with contextlib.suppress(Exception):
+                    announce(instance, host=host, port=port, address=ip)
+                stop.wait(interval)
+
+        thread = threading.Thread(target=announce_loop, daemon=True, name="swarm-hub-mdns")
+        thread.start()
+        self._mdns_thread = thread
+        self.advertised_url = "http://{}:{}".format(ip, port)
+        return self.advertised_url
+
+    def stop_lan_announce(self) -> None:
+        if self._mdns_stop is not None:
+            self._mdns_stop.set()
+        self._mdns_thread = None
 
     def set_agent_payload(self, payload: bytes) -> None:
         import hashlib
@@ -390,11 +454,24 @@ class Hub:
                             from ..integrator.synthesize import SynthesisLoop
 
                             contract = load_contract(contract_name)
-                            try:
-                                difficulty = float(payload.get("difficulty", 0.9))
-                            except (TypeError, ValueError):
-                                difficulty = 0.9
-                            route = hub.brain.route(difficulty)
+                            # An explicit difficulty from the caller wins; with
+                            # none, estimate it from the contract rather than
+                            # falling back to a constant that escalated
+                            # everything to the frontier lane.
+                            raw = payload.get("difficulty")
+                            if raw is None:
+                                difficulty = hub.brain.estimate_difficulty(contract)
+                                difficulty_source = "estimated"
+                            else:
+                                try:
+                                    difficulty = float(raw)
+                                    difficulty_source = "caller"
+                                except (TypeError, ValueError):
+                                    difficulty = hub.brain.estimate_difficulty(contract)
+                                    difficulty_source = "estimated"
+                            route = hub.brain.route(
+                                difficulty, difficulty_source=difficulty_source
+                            )
                             client = hub.brain.client_for(route["lane"])
                             if client is None:
                                 self._send_json(
@@ -457,7 +534,35 @@ a.btn{{display:inline-block;background:#3cc492;color:#0f1215;padding:12px 24px;b
             bench = from_dict(BenchResult, bench_data)
             self.registry.record_bench(profile.node_id, bench)
         self._apply_verdicts(profile, payload)
+        self._index_device_classes(profile)
         return profile.node_id
+
+    def _index_device_classes(self, profile: NodeProfile) -> None:
+        """Record which device classes this node can serve, from its MEASURED
+        profile — this is what turns `device_class` work routing on.
+
+        Two granularities per device, because contracts are written at both:
+        the specific class (`intel:intel_r_iris_r_xe_graphics`) that an adapter
+        is gated against, and the coarse kind (`gpu:generic`) a capability
+        contract targets. `cpu:generic` is unconditional — every node that
+        registered got here by running code on a CPU.
+
+        Only devices the probe actually found are indexed. A class this node
+        does not have is a class it does not serve; unrestricted work (no
+        device_class) still reaches every node.
+        """
+        from .coverage import device_class
+
+        classes = {"cpu:generic"}
+        for dev in getattr(profile, "devices", None) or []:
+            vendor = getattr(dev, "vendor", None)
+            name = getattr(dev, "name", None)
+            kind = getattr(dev, "kind", None)
+            classes.add(device_class(vendor, name))
+            if kind:
+                classes.add("{}:generic".format(str(kind).strip().lower()))
+        with contextlib.suppress(Exception):
+            self.queue.set_node_device_classes(profile.node_id, sorted(classes))
 
     def _apply_verdicts(self, profile: NodeProfile, payload: Dict[str, Any]) -> None:
         """Worth-it gate + Tier-0 bindings land on registration (and any
@@ -502,7 +607,16 @@ a.btn{{display:inline-block;background:#3cc492;color:#0f1215;padding:12px 24px;b
         if not op or not isinstance(params_list, list) or not params_list:
             raise ValueError("submit requires op and non-empty params_list")
         idem_keys = [canonical_hash({"op": op, "params": params}) for params in params_list]
-        return self.queue.submit_bag(op, params_list, idem_keys)
+        # device_class is what makes a bag hardware-targeted. Dropping it here
+        # silently turned every classed submission into unrestricted work —
+        # the HTTP path is the only one real agents use.
+        device_class = payload.get("device_class")
+        return self.queue.submit_bag(
+            op,
+            params_list,
+            idem_keys,
+            device_class=str(device_class) if device_class else None,
+        )
 
     def handle_pull(self, node_id: str) -> Dict[str, Any]:
         if self.queue.is_suspended(node_id):
@@ -607,6 +721,7 @@ a.btn{{display:inline-block;background:#3cc492;color:#0f1215;padding:12px 24px;b
         return self.host, self.port
 
     def stop(self) -> None:
+        self.stop_lan_announce()
         if self._httpd is not None:
             self._httpd.shutdown()
             self._httpd.server_close()
@@ -615,8 +730,21 @@ a.btn{{display:inline-block;background:#3cc492;color:#0f1215;padding:12px 24px;b
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Swarm hub")
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="bind address; loopback by default so a hub is never exposed by accident",
+    )
     parser.add_argument("--port", type=int, default=8777)
+    parser.add_argument(
+        "--lan",
+        action="store_true",
+        help=(
+            "opt in to LAN mode: bind all interfaces and announce this hub over mDNS "
+            "so agents can find it without --hub. Discovery only; joining still "
+            "requires an enrollment token."
+        ),
+    )
     parser.add_argument(
         "--db",
         default=None,
@@ -634,14 +762,30 @@ def main() -> None:
         db = str(state_dir / "hub.db")
     else:
         db = args.db
-    hub = Hub(host=args.host, port=args.port, db_path=db)
+    host = args.host
+    if args.lan and host == "127.0.0.1":
+        host = "0.0.0.0"  # explicit operator opt-in via --lan
+    hub = Hub(host=host, port=args.port, db_path=db)
     if args.serve_agent:
         from .agentbundle import build_agent_pyz
 
         payload = build_agent_pyz()
         hub.set_agent_payload(payload)
         print(f"agent bundle ready at /agent.pyz ({len(payload)} bytes)")
-    print(f"swarm hub listening on http://{args.host}:{args.port} (dashboard at /, db={db})")
+    print(f"swarm hub listening on http://{host}:{args.port} (dashboard at /, db={db})")
+    if args.lan:
+        url = hub.start_lan_announce()
+        if url:
+            print(f"LAN mode: announcing {url} over mDNS (_swarm._tcp.local)")
+            print("join from another machine on this network:")
+            print(f"  python -m swarm.agent.daemon --hub {url}")
+            print("  python -m swarm.agent.daemon            # finds this hub via mDNS")
+            print("discovery advertises this hub; joining still needs an enrollment token.")
+        else:
+            print(
+                "LAN mode: no non-loopback address found, so nothing is being announced. "
+                "Pass --host <ip> explicitly."
+            )
     try:
         hub.serve_forever()
     except KeyboardInterrupt:

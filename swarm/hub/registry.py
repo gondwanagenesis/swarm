@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from ..core.models import BenchResult, LinkMeasurement, NodeProfile
 from ._sync import synchronized
+from .adapter_store import AdapterStore, store_for
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS nodes (
@@ -67,6 +68,7 @@ CREATE TABLE IF NOT EXISTS adapters (
     probe_evidence_hash TEXT,
     gate_run_id TEXT,
     exemplar_id TEXT,
+    source_hash TEXT,
     at REAL
 );
 CREATE TABLE IF NOT EXISTS runtime_bindings (
@@ -96,9 +98,21 @@ CREATE TABLE IF NOT EXISTS gate_runs (
 );
 """
 
+# Additive column migrations, applied to databases created before the column
+# existed. `PRAGMA user_version` on this connection belongs to WorkQueue (it
+# shares the Registry connection), so presence is detected per-column via
+# PRAGMA table_info instead of a version counter.
+_COLUMN_MIGRATIONS = (
+    ("adapters", "source_hash", "TEXT"),
+)
+
 
 class Registry:
-    def __init__(self, db_path: Union[str, Path] = ":memory:") -> None:
+    def __init__(
+        self,
+        db_path: Union[str, Path] = ":memory:",
+        store: Optional[AdapterStore] = None,
+    ) -> None:
         self.db_path = str(db_path)
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
@@ -107,7 +121,20 @@ class Registry:
             self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=30000")
         self._conn.executescript(_SCHEMA)
+        self._migrate()
         self._conn.commit()
+        self.store = store if store is not None else store_for(self.db_path)
+
+    def _migrate(self) -> None:
+        """Add columns missing from databases created by an older schema."""
+        for table, column, coltype in _COLUMN_MIGRATIONS:
+            rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+            if not rows:
+                continue
+            present = {r["name"] for r in rows}
+            if column in present:
+                continue
+            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
 
     def close(self) -> None:
         self._conn.close()
@@ -213,11 +240,20 @@ class Registry:
         probe_evidence_hash: str = "",
         gate_run_id: str = "",
         exemplar_id: str = "",
+        source: str = "",
     ) -> None:
+        """Record an adapter. When `source` is given the code itself is kept.
+
+        A proven adapter that nothing can load is not proof of anything, so the
+        source bytes go into the content-addressed store and the row carries the
+        hash that addresses them.
+        """
+        source_hash = self.store.put(source) if source else None
         self._conn.execute(
             """INSERT OR IGNORE INTO adapters
-               (adapter_id, device_class, authored_by, probe_evidence_hash, gate_run_id, exemplar_id, at)
-               VALUES (?,?,?,?,?,?,?)""",
+               (adapter_id, device_class, authored_by, probe_evidence_hash, gate_run_id,
+                exemplar_id, source_hash, at)
+               VALUES (?,?,?,?,?,?,?,?)""",
             (
                 adapter_id,
                 device_class,
@@ -225,10 +261,32 @@ class Registry:
                 probe_evidence_hash,
                 gate_run_id,
                 exemplar_id,
+                source_hash,
                 time.time(),
             ),
         )
+        if source_hash:
+            # INSERT OR IGNORE silently drops a re-record of a known adapter;
+            # backfill the source for rows registered before the code arrived.
+            self._conn.execute(
+                "UPDATE adapters SET source_hash=? WHERE adapter_id=? AND "
+                "(source_hash IS NULL OR source_hash='')",
+                (source_hash, adapter_id),
+            )
         self._conn.commit()
+
+    @synchronized
+    def get_adapter_source(self, adapter_id: str) -> Optional[str]:
+        """Source code of a recorded adapter, or None if none was stored."""
+        row = self._conn.execute(
+            "SELECT source_hash FROM adapters WHERE adapter_id = ?", (adapter_id,)
+        ).fetchone()
+        if not row:
+            return None
+        source_hash = row["source_hash"]
+        if not source_hash:
+            return None
+        return self.store.get(source_hash)
 
     @synchronized
     def list_nodes(self) -> List[Dict[str, Any]]:

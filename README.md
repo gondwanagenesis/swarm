@@ -40,22 +40,39 @@ detector, no central brain that must stay alive for cells to keep working.
 **It never cuts the host to run.** Userspace only, forever. Six laws in
 [`AGENTS.md`](AGENTS.md) are load-bearing, enforced by tests, not intentions.
 
-## Today (M1–M5 shipped, CI green)
+## Today — what is proven, and what is only built
 
-| Organ | State |
-|---|---|
-| Sensing (probe + capability tower) | **Live.** Never raises, never hangs; honestly tags every measurement with a trust tier. |
-| Memory (hub registry) | **Live.** sqlite, content-addressed, adapter provenance schema ready. |
-| Metabolism (pull-based bag-of-tasks) | **Live.** Leased chunks sized by measured throughput × confidence; expiry sweeps regrow lost work; idempotent results. Kill-node demo proven exactly-once. |
-| Nerve endings (hotplug watch) | **Live.** New device on an enrolled node is diffed, re-probed, and re-registered. |
-| Immune system (adapter coverage) | **Live.** Every sensed device: proven-adapter covered or surfaced as uncovered with reasons. |
-| Tail muscle (M3) | **Live.** p90-style hedging (>75% bag, >1.5× median), earned node tiers (Core/Elastic/Opportunistic), suspension rail after 3 consecutive expiries. |
-| The stomach (M4) | **Live.** Tier-0 discovery first; pilot sniff; worth-it gate; hand-proven contract gate; NeuralWatt-keyed synthesis, budget-capped, promotion only after the gate passes. |
-| Consent membrane (M4.5) | **Live.** Enrollment tokens + one-click invite page + per-invite bundled agent. Welfare loop — the organism exhales when you're typing or battery's low. |
-| The spore (E+) | **Live.** `--seed` watches interfaces/adb for attachments; zero-click spread onto fleet-token devices; one-click for anything else; growth logged. |
-| The teeth (M5) | **Scaffold.** Measured-memory pipeline planner at `/api/pipeline/plan`; behavioral model runs land with M5 proper. |
-| Gene expression (workshop) | **Live.** The organism edits its own code — but only through law: proposals are sandboxed against the full test suite + stdlib gate, staged, applied only on operator approval, every byte content-hashed in the patch ledger, and rollback restores exact bytes. It writes itself like a careful contractor, not a hallucinating intern. |
-| Collective motion (M6) | **Not yet.** Multi-model packing, adaptive replication. |
+Two columns, deliberately. **Proven** means a test or a demo exercises the real
+behaviour on real hardware. **Built** means the code path exists and is
+exercised against fakes, but no run on real silicon has earned it yet. The
+organism does not get to grade itself on intentions — see `AGENTS.md`, Law 1.
+
+Where a claim is bounded by the hardware it was measured on, the bound is
+stated. Nothing here is marked proven because it looked right.
+
+
+| Organ | State | Evidence / bound |
+|---|---|---|
+| Sensing (probe + capability tower) | **Proven** | Never raises, never hangs; every measurement carries a trust tier. Full probe runs on this machine. |
+| Memory (hub registry) | **Proven** | sqlite, content-addressed. Adapter **source** is now persisted and retrievable, not just its hash. |
+| Metabolism (pull-based bag-of-tasks) | **Proven** | `demo_m2.py`: 3 workers, 1 killed mid-bag, 400/400 completed exactly once. |
+| Nerve endings (hotplug watch) | **Proven** | Device diff → re-probe → re-register; removal retracts the class rather than leaving a ghost. |
+| Device-class routing | **Proven** | Registration indexes classes from the measured profile. GPU-classed work does not leak to CPU-only nodes; an unservable bag is visibly blocked with a reason, never silently queued. |
+| Tail muscle (M3) | **Proven** | Hedging (>75% bag, >1.5× median), earned tiers, suspension after 3 consecutive expiries. |
+| Contract gate (M4) | **Proven** | Contract-driven entrypoint + comparison; candidate code runs in a **subprocess**, not restricted-`exec`. Timeout, crash, and forged-stdout all fail closed. Known-bad rejection asserted in CI. |
+| LAN discovery | **Proven** | Raw mDNS PTR+SRV+A; a `DiscoveryLoop` resolved a live announcing hub over real multicast. Degrades to "no peers" — never crashes, never guesses. |
+| Consent membrane (M4.5) | **Proven** | Enrollment tokens, one-click invite, per-invite bundle. Discovery finds candidates; it never enrolls. |
+| Welfare loop | **Proven** | Backs off on typing / battery; demos must opt out explicitly and loudly. |
+| Gene expression (workshop) | **Proven** | Self-edits only through a sandboxed gate; every byte content-hashed; rollback restores exact bytes. |
+| Accelerated compute (GPU tier) | **Built, unproven here** | `matmul` degrades torch-CUDA → numpy/BLAS → torch-CPU → pure Python and **reports which tier actually ran**. This machine has an Intel Iris Xe with no bound runtime and CPU-only torch, so the CUDA path has never executed. It needs a CUDA box to earn "proven". |
+| Adapter synthesis (M4 Tier 1) | **Built, unproven here** | Loop, budget cap, and promotion-only-after-gate are wired and tested against scripted LLMs. No run against a live model has been recorded. |
+| The teeth (M5) | **Planner proven, execution absent** | Exact DP contiguous-chain min-max partition; reports `bottleneck_ms` and `latency_ms` separately. It **does not run models** — no weights, no tensor transport. |
+| Collective motion (M6) | **Not started** | Multi-model packing, adaptive replication. |
+
+**The honest summary:** the scheduling and measurement organism is real and
+proven under failure. The compute it schedules is, today, CPU work plus a
+GPU path that no machine here could exercise. That gap is the next milestone,
+not a footnote.
 
 ## RSSI of the organism (the fuel gauge)
 
@@ -82,7 +99,19 @@ plus the uncovered-device wall so you watch the organism learn its own body.
 
 Demos: `python scripts/demo.py` (one node, full loop) · `python scripts/demo_m2.py`
 (three workers, one killed mid-bag, exactly-once completion) ·
-`python scripts/demo_hotplug.py` (plug and watch it notice).
+`python scripts/demo_hotplug.py` (plug and watch it notice) ·
+`python scripts/demo_fabric.py` (probe → tower → device classes → routed
+matmul → **which tier actually ran it** → an unservable bag failing loudly).
+
+Agents can now find a hub instead of being told one:
+
+```sh
+python -m swarm.hub.server --lan          # bind all interfaces + announce over mDNS
+python -m swarm.agent.daemon --work       # no --hub: discovers it on the LAN
+```
+
+Discovery yields a *candidate address only* — joining still goes through the
+token/consent path. Finding a hub is not the same as being recruited by one.
 
 ## The brain — three lanes, one kill switch
 

@@ -1,0 +1,51 @@
+{
+  "name": "gpu-matmul-f32-v1",
+  "device_class": "gpu:generic",
+  "op": "matmul",
+  "description": "Dense matrix multiply, C = A @ B, given as nested row-major lists. Exists to prove the contract gate is general: same gate code path as the CPU prime contract, different entrypoint, different arity, different comparison mode. Floating-point results are compared with allclose, never with ==.",
+  "entrypoint": "matmul",
+  "signature": {
+    "style": "positional",
+    "arg_order": ["a", "b"]
+  },
+  "compare": "allclose",
+  "rtol": 1e-09,
+  "atol": 1e-12,
+  "timeout_s": 10,
+  "cases": [
+    {
+      "input": {"a": [[1, 2], [3, 4]], "b": [[1, 0], [0, 1]]},
+      "expected": [[1, 2], [3, 4]],
+      "note": "square, symmetric B (identity). The naive functional test everyone writes — and the known-bad passes it."
+    },
+    {
+      "input": {"a": [[1, 2], [3, 4]], "b": [[5, 6], [7, 8]]},
+      "expected": [[19, 22], [43, 50]],
+      "note": "square, NON-symmetric B. Catches the transposed-B known-bad: it computes A @ Bt = [[17, 23], [39, 53]]."
+    },
+    {
+      "input": {"a": [[1, 2, 3], [4, 5, 6]], "b": [[7, 8], [9, 10], [11, 12]]},
+      "expected": [[58, 64], [139, 154]],
+      "note": "non-square (2x3 @ 3x2). The transposed-B known-bad indexes B out of range here and raises."
+    },
+    {
+      "input": {"a": [[0.1, 0.2], [0.3, 0.4]], "b": [[1.0, 2.0], [3.0, 4.0]]},
+      "expected": [[0.7, 1.0], [1.5, 2.2]],
+      "note": "float accumulation: 0.1*1 + 0.2*3 == 0.7000000000000001, so exact comparison would wrongly reject a correct adapter. This case is why compare is allclose."
+    },
+    {
+      "input": {"a": [[2]], "b": [[3]]},
+      "expected": [[6]],
+      "note": "1x1 degenerate case — every wrong implementation in this family still passes it."
+    }
+  ],
+  "known_good": {
+    "type": "python",
+    "source": "def matmul(a, b):\n    rows = len(a)\n    inner = len(b)\n    cols = len(b[0])\n    out = []\n    for i in range(rows):\n        row = []\n        for j in range(cols):\n            acc = 0\n            for k in range(inner):\n                acc += a[i][k] * b[k][j]\n            row.append(acc)\n        out.append(row)\n    return out\n"
+  },
+  "known_bad": {
+    "type": "python",
+    "source": "def matmul(a, b):\n    rows = len(a)\n    inner = len(a[0])\n    cols = len(b[0])\n    out = []\n    for i in range(rows):\n        row = []\n        for j in range(cols):\n            acc = 0\n            for k in range(inner):\n                acc += a[i][k] * b[j][k]\n            row.append(acc)\n        out.append(row)\n    return out\n",
+    "reason": "Transposed indexing on B: it accumulates a[i][k] * b[j][k] instead of a[i][k] * b[k][j], so it computes A @ transpose(B). Output shape is always right, so a shape assertion passes; it is exactly correct for symmetric B (identity, diagonal, covariance-like matrices), which is what a naive smoke test uses; and on non-square operands it indexes B out of range. Only case 2 (non-symmetric square) and case 3 (non-square) catch it — if the gate cannot fail this, the gate does not deploy."
+  }
+}

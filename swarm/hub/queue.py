@@ -17,7 +17,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ._sync import synchronized
 
@@ -59,6 +59,12 @@ CREATE TABLE IF NOT EXISTS node_stats (
     ewma_var REAL DEFAULT 0,
     samples INTEGER DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS node_device_classes (
+    node_id TEXT NOT NULL,
+    device_class TEXT NOT NULL,
+    at REAL,
+    PRIMARY KEY (node_id, device_class)
+);
 """
 
 _MIGRATION_V2 = [
@@ -72,7 +78,17 @@ _MIGRATION_V2 = [
     "ALTER TABLE node_stats ADD COLUMN suspended INTEGER DEFAULT 0",
 ]
 
-SCHEMA_VERSION = 2
+_MIGRATION_V3 = [
+    "ALTER TABLE bags ADD COLUMN device_class TEXT",
+    "ALTER TABLE tasks ADD COLUMN device_class TEXT",
+]
+
+_MIGRATIONS = {
+    2: _MIGRATION_V2,
+    3: _MIGRATION_V3,
+}
+
+SCHEMA_VERSION = 3
 
 HEDGE_FRACTION_GATE = 0.75
 HEDGE_ELAPSED_MULTIPLE = 1.5
@@ -102,31 +118,95 @@ class WorkQueue:
         self.conn.executescript(_SCHEMA)
         version = self.conn.execute("PRAGMA user_version").fetchone()[0]
         if version < SCHEMA_VERSION:
-            for stmt in _MIGRATION_V2:
-                with contextlib.suppress(sqlite3.OperationalError):
-                    self.conn.execute(stmt)
+            # Step through every migration the database has not seen yet.
+            # ALTERs are idempotent-by-suppression, so a half-applied upgrade
+            # (killed mid-flight) heals on the next open.
+            for target in range(int(version) + 1, SCHEMA_VERSION + 1):
+                for stmt in _MIGRATIONS.get(target, []):
+                    with contextlib.suppress(sqlite3.OperationalError):
+                        self.conn.execute(stmt)
             self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self.conn.commit()
 
     @synchronized
-    def submit_bag(self, op: str, params_list: List[Dict[str, Any]], idem_keys: List[str]) -> str:
+    def submit_bag(
+        self,
+        op: str,
+        params_list: List[Dict[str, Any]],
+        idem_keys: List[str],
+        device_class: Optional[str] = None,
+        task_device_classes: Optional[List[Optional[str]]] = None,
+    ) -> str:
+        """Submit a bag. `device_class=None` (the default) means any node —
+        that is the pre-existing behaviour and stays untouched.
+
+        A bag with a device_class only leases to nodes known to serve that
+        class (see `set_node_device_classes` / `pull`). Per-task overrides go
+        in `task_device_classes`, positionally aligned with `params_list`."""
         bag_id = new_bag_id()
         now = time.time()
         rows = [
-            (bag_id, seq, idem_keys[seq], _json(params_list[seq]), "queued", None, None, 0, None)
+            (
+                bag_id,
+                seq,
+                idem_keys[seq],
+                _json(params_list[seq]),
+                "queued",
+                None,
+                None,
+                0,
+                None,
+                _task_class(task_device_classes, seq, device_class),
+            )
             for seq in range(len(params_list))
         ]
         with self.conn:
             self.conn.execute(
-                "INSERT INTO bags (bag_id, op, total, created_at) VALUES (?,?,?,?)",
-                (bag_id, op, len(params_list), now),
+                "INSERT INTO bags (bag_id, op, total, created_at, device_class) VALUES (?,?,?,?,?)",
+                (bag_id, op, len(params_list), now, device_class),
             )
             self.conn.executemany(
-                "INSERT INTO tasks (bag_id, seq, idem_key, params_json, status, leased_to, lease_expires_at, attempts, result_key)"
-                " VALUES (?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO tasks (bag_id, seq, idem_key, params_json, status, leased_to, lease_expires_at, attempts, result_key, device_class)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
                 rows,
             )
         return bag_id
+
+    # ------------------------------------------------------------------
+    # node capability index: which device classes a node can actually serve
+    # ------------------------------------------------------------------
+
+    @synchronized
+    def set_node_device_classes(self, node_id: str, device_classes: List[str]) -> int:
+        """Record the device classes a node has PROVEN it serves.
+
+        The hub writes this from measured bindings/verdicts — never from a
+        node's own declaration. Replaces the node's whole set."""
+        classes = sorted({str(c) for c in device_classes if c})
+        now = time.time()
+        with self.conn:
+            self.conn.execute("DELETE FROM node_device_classes WHERE node_id=?", (node_id,))
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO node_device_classes (node_id, device_class, at) VALUES (?,?,?)",
+                [(node_id, c, now) for c in classes],
+            )
+        return len(classes)
+
+    @synchronized
+    def node_device_classes(self, node_id: str) -> List[str]:
+        rows = self.conn.execute(
+            "SELECT device_class FROM node_device_classes WHERE node_id=? ORDER BY device_class",
+            (node_id,),
+        ).fetchall()
+        return [r["device_class"] for r in rows]
+
+    @synchronized
+    def served_device_classes(self) -> List[str]:
+        """Every device class some node in the fleet is known to serve."""
+        rows = self.conn.execute(
+            "SELECT DISTINCT device_class FROM node_device_classes ORDER BY device_class"
+        ).fetchall()
+        return [r["device_class"] for r in rows]
 
     @synchronized
     def sweep_expired(self, now: Optional[float] = None) -> int:
@@ -145,6 +225,19 @@ class WorkQueue:
         self.conn.commit()
         return cur.rowcount
 
+    def _serve_set(
+        self, node_id: str, node_device_classes: Optional[Sequence[str]]
+    ) -> List[str]:
+        """Which device classes this node may be handed work for.
+
+        An explicit argument wins (the caller measured it just now); with no
+        argument we fall back to what the hub recorded for this node. A node
+        we know nothing about serves nothing device-specific — fail closed,
+        never assume a capability."""
+        if node_device_classes is not None:
+            return sorted({str(c) for c in node_device_classes if c})
+        return self.node_device_classes(node_id)
+
     @synchronized
     def pull(
         self,
@@ -152,18 +245,29 @@ class WorkQueue:
         n_items: int,
         lease_seconds: float,
         predicted_ms_per_item: float,
+        node_device_classes: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Claim up to n_items queued tasks for node_id under a lease.
-        Atomically claims rows so no two pullers share a task."""
+        Atomically claims rows so no two pullers share a task.
+
+        Tasks whose effective device_class this node cannot serve are simply
+        not visible to it. Unrestricted tasks (device_class NULL) are visible
+        to everyone, so nodes that predate device routing keep working."""
         self.sweep_expired()
         now = time.time()
         expires = now + max(lease_seconds, 5.0)
+        serves = self._serve_set(node_id, node_device_classes)
+        where, params = _class_filter(serves)
         try:
             self.conn.execute("BEGIN IMMEDIATE")
             rows = self.conn.execute(
-                """SELECT bag_id, seq FROM tasks WHERE status='queued'
-                   ORDER BY bag_id, seq LIMIT ?""",
-                (n_items,),
+                """SELECT t.bag_id AS bag_id, t.seq AS seq FROM tasks t
+                   JOIN bags b ON b.bag_id = t.bag_id
+                   WHERE t.status='queued' AND """
+                + where
+                + """
+                   ORDER BY t.bag_id, t.seq LIMIT ?""",
+                (*params, n_items),
             ).fetchall()
             if rows:
                 claim = [(node_id, expires, now, bag, seq) for bag, seq in rows]
@@ -176,7 +280,11 @@ class WorkQueue:
             self.conn.execute("ROLLBACK")
             raise
         if not rows:
-            hedges = self.pull_hedges(node_id, limit=max(1, min(n_items, 2)))
+            hedges = self.pull_hedges(
+                node_id,
+                limit=max(1, min(n_items, 2)),
+                node_device_classes=node_device_classes,
+            )
             return hedges
         out: List[Dict[str, Any]] = []
         for bag_id, seq in rows:
@@ -198,7 +306,12 @@ class WorkQueue:
         return out
 
     @synchronized
-    def pull_hedges(self, node_id: str, limit: int = 2) -> List[Dict[str, Any]]:
+    def pull_hedges(
+        self,
+        node_id: str,
+        limit: int = 2,
+        node_device_classes: Optional[Sequence[str]] = None,
+    ) -> List[Dict[str, Any]]:
         """Speculative re-execution of stragglers: only once >75% of a bag is
         claimed, only tasks running > 1.5x the bag's median observed item
         duration, at most one hedge per task. The original lease stays alive;
@@ -206,9 +319,12 @@ class WorkQueue:
         self.sweep_expired()
         now = time.time()
         out: List[Dict[str, Any]] = []
+        serves = self._serve_set(node_id, node_device_classes)
         for bag in self.open_bags():
             if len(out) >= limit:
                 break
+            if not _node_can_serve(bag.get("device_class"), serves):
+                continue
             total = bag["total"]
             if total <= 0:
                 continue
@@ -224,13 +340,16 @@ class WorkQueue:
             if median_s <= 0:
                 continue
             threshold_started = now - (median_s * HEDGE_ELAPSED_MULTIPLE)
+            task_where, task_params = _class_filter(serves, column="device_class")
             rows = self.conn.execute(
                 """SELECT bag_id, seq, idem_key, params_json FROM tasks
                    WHERE bag_id=? AND status='leased' AND hedge_count < 1
                      AND lease_started_at IS NOT NULL AND lease_started_at < ?
-                     AND leased_to != ?
+                     AND leased_to != ? AND """
+                + task_where
+                + """
                    LIMIT ?""",
-                (bag["bag_id"], threshold_started, node_id, limit - len(out)),
+                (bag["bag_id"], threshold_started, node_id, *task_params, limit - len(out)),
             ).fetchall()
             for row in rows:
                 lease = max(30.0, median_s * 3.0 + 30.0)
@@ -391,7 +510,8 @@ class WorkQueue:
     @synchronized
     def bag_status(self, bag_id: str) -> Optional[Dict[str, Any]]:
         row = self.conn.execute(
-            "SELECT bag_id, op, total, done, created_at, status FROM bags WHERE bag_id=?", (bag_id,)
+            "SELECT bag_id, op, total, done, created_at, status, device_class FROM bags WHERE bag_id=?",
+            (bag_id,),
         ).fetchone()
         if row is None:
             return None
@@ -404,7 +524,35 @@ class WorkQueue:
         ).fetchone()
         out["queued"] = remaining["n"]
         out["leased"] = leased["n"]
+        out["servable"] = True
+        out["blocked_reason"] = None
+        # A bag nobody can run must never just sit there looking healthy.
+        needed = sorted(
+            {
+                r["dc"]
+                for r in self.conn.execute(
+                    "SELECT DISTINCT COALESCE(device_class, ?) AS dc FROM tasks WHERE bag_id=? AND status='queued'",
+                    (out.get("device_class"), bag_id),
+                ).fetchall()
+                if r["dc"]
+            }
+        )
+        if needed:
+            served = set(self.served_device_classes())
+            missing = [dc for dc in needed if dc not in served]
+            if missing:
+                out["servable"] = False
+                out["blocked_reason"] = "no node serves device_class %s (%d task(s) queued)" % (
+                    ", ".join(missing),
+                    out["queued"],
+                )
         return out
+
+    @synchronized
+    def unservable_bags(self) -> List[Dict[str, Any]]:
+        """Open bags whose remaining work no known node can run. Fail loud:
+        callers surface these instead of letting the bag hang forever."""
+        return [bag for bag in self.open_bags() if not bag.get("servable", True)]
 
     @synchronized
     def open_bags(self) -> List[Dict[str, Any]]:
@@ -429,6 +577,39 @@ class WorkQueue:
             (bag_id,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def _task_class(
+    task_device_classes: Optional[List[Optional[str]]], seq: int, bag_class: Optional[str]
+) -> Optional[str]:
+    """Per-task override, else the bag's class, else unrestricted."""
+    if task_device_classes and seq < len(task_device_classes):
+        override = task_device_classes[seq]
+        if override:
+            return str(override)
+    return bag_class
+
+
+def _class_filter(
+    serves: Sequence[str], column: str = "COALESCE(t.device_class, b.device_class)"
+) -> Tuple[str, List[str]]:
+    """SQL fragment: rows this node is allowed to see.
+
+    Unrestricted rows (NULL) are visible to every node. Restricted rows are
+    visible only to nodes that serve the class — and a node serving nothing
+    sees only unrestricted rows (`IN ()` is not valid SQL, so that case is
+    the bare NULL test)."""
+    if not serves:
+        return ("(%s IS NULL)" % column, [])
+    placeholders = ",".join("?" * len(serves))
+    return (
+        "(%s IS NULL OR %s IN (%s))" % (column, column, placeholders),
+        [str(c) for c in serves],
+    )
+
+
+def _node_can_serve(required: Optional[str], serves: Sequence[str]) -> bool:
+    return not required or required in set(serves)
 
 
 def _json(obj: Any) -> str:
