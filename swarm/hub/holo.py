@@ -231,12 +231,22 @@ class Holo:
             self.settings.set("last_successors", json.dumps(current))
         return None
 
-    def start_peer_watch(self, interval: float = PEER_CHECK_S) -> None:
+    def start_peer_watch(self, interval: Optional[float] = None) -> None:
+        """Look for a newer (or better-ranked, same-epoch) hub of this swarm.
+        Early checks are fast — right after a failover two successors can race,
+        and the loser must step aside in seconds, not a minute later."""
         if self._peer_thread is not None:
             return
+        import os
+
+        steady = float(interval if interval is not None else os.environ.get("SWARM_PEER_CHECK_S", PEER_CHECK_S))
+        schedule = [3.0, 7.0, 20.0]
 
         def loop() -> None:
-            while not self._stop.wait(interval):
+            while True:
+                wait = schedule.pop(0) if schedule else steady
+                if self._stop.wait(wait):
+                    return
                 try:
                     if self.demoted is None:
                         self.check_peers_once()

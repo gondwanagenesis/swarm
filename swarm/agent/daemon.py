@@ -242,6 +242,12 @@ class Agent:
                     moved = {}
                 target = moved.get("moved_to")
                 if target and int(moved.get("epoch") or 0) >= (self.holo.epoch if self.holo else 0):
+                    if self._hub_proc is not None:
+                        # the hub WE were running lost a promotion race: retire it
+                        with contextlib.suppress(Exception):
+                            self._hub_proc.terminate()
+                        self._hub_proc = None
+                        print(f"[holo] our hub stepped aside for {target}; following it", flush=True)
                     self.switch_hub(str(target))
                 return None
             if resp.status != 200:

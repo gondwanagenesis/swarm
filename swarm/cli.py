@@ -65,7 +65,12 @@ class Client:
                 parsed = json.loads(body)
                 msg = (parsed.get("error") or {}).get("message") if isinstance(parsed.get("error"), dict) else parsed.get("error")
             except ValueError:
-                msg = body[:300]
+                parsed, msg = {}, body[:300]
+            if exc.code == 409 and parsed.get("moved_to") and parsed["moved_to"].rstrip("/") != self.hub:
+                # This hub stepped aside after a failover: follow it, once.
+                print(f"(hub moved to {parsed['moved_to']} — epoch {parsed.get('epoch')}; following)", file=sys.stderr)
+                self.hub = parsed["moved_to"].rstrip("/")
+                return self.call(path, payload, timeout)
             raise SystemExit(f"hub said {exc.code}: {msg}") from None
         except urllib.error.URLError as exc:
             raise SystemExit(f"cannot reach the hub at {self.hub}: {exc.reason}") from None

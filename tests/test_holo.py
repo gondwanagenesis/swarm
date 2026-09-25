@@ -205,3 +205,26 @@ def test_choose_hub_waits_its_rank_grace(tmp_path, monkeypatch, dead_for, expect
         {"rank": 1, "node_id": "me", "url": "http://127.0.0.1:9"},
     ]}
     assert agent_holo.choose_hub(st, dead_for)["action"] == expected
+
+
+def test_a_promotion_race_resolves_toward_the_better_rank(tmp_path):
+    """Two successors both promoted (slow start, flaky link): same epoch, so
+    the worse-ranked hub must step aside and point at the better one."""
+    winner = Hub(host="127.0.0.1", port=0, db_path=str(tmp_path / "w.db"))
+    loser = Hub(host="127.0.0.1", port=0, db_path=str(tmp_path / "l.db"))
+    loser.holo.settings.set("swarm_id", winner.holo.swarm_id)
+    for hub, rank in ((winner, 0), (loser, 1)):
+        hub.holo.set_epoch(2)
+        hub.holo.settings.set("promoted_rank", rank)
+    _, wport = winner.start_background()
+    _, lport = loser.start_background()
+    try:
+        peers = json.dumps([{"url": f"http://127.0.0.1:{wport}", "rank": 0}, {"url": f"http://127.0.0.1:{lport}", "rank": 1}])
+        for hub in (winner, loser):
+            hub.holo.settings.set("last_successors", peers)
+        assert winner.holo.check_peers_once() is None, "the better rank keeps serving"
+        moved = loser.holo.check_peers_once()
+        assert moved and moved["moved_to"] == f"http://127.0.0.1:{wport}"
+    finally:
+        winner.stop()
+        loser.stop()
