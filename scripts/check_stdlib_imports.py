@@ -80,6 +80,26 @@ BASELINE = {
     "xml",
     "zipfile",
     "zlib",
+    # added with the usable-fabric pass (all stdlib; absent from the list
+    # the py3.9 legs fall back to)
+    "atexit",
+    "base64",
+    "binascii",
+    "bisect",
+    "codecs",
+    "fcntl",
+    "gzip",
+    "heapq",
+    "hmac",
+    "html",
+    "ipaddress",
+    "msvcrt",
+    "pickletools",
+    "shlex",
+    "stat",
+    "tarfile",
+    "urllib",
+    "winreg",
 }
 
 
