@@ -42,6 +42,7 @@ POSIX_TEMPLATE = r'''#!/bin/sh
 # Options (env vars): DEDICATED=1 keep working while the device is in use
 #                     AUTOSTART=0 do not start on boot
 #                     SWARM_LLAMA=0 do not install llama.cpp
+#                     CODE_WORKER=1 accept code an AI wrote (default on Android: app-sandboxed)
 set -e
 HUB="__HUB__"
 TOKEN="__TOKEN__"
@@ -50,6 +51,7 @@ LLAMA_TAG="__LLAMA_TAG__"
 DEDICATED="${DEDICATED:-__DEDICATED__}"
 AUTOSTART="${AUTOSTART:-1}"
 SWARM_LLAMA="${SWARM_LLAMA:-1}"
+CODE_WORKER="${CODE_WORKER:-}"
 DIR="$HOME/.swarm"
 HERE="$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo .)"
 mkdir -p "$DIR"
@@ -57,13 +59,15 @@ mkdir -p "$DIR"
 IS_TERMUX=0
 if [ -n "$TERMUX_VERSION" ] || [ -d /data/data/com.termux/files/usr ]; then IS_TERMUX=1; fi
 
+if [ -z "$CODE_WORKER" ]; then CODE_WORKER="$IS_TERMUX"; fi
 echo "== Joining this device to the swarm at $HUB =="
 echo "This will:"
 echo "  - put the swarm agent (one ~200 KB file) in $DIR"
 [ "$IS_TERMUX" = 1 ] && echo "  - install Python with pkg if it is missing"
 [ "$SWARM_LLAMA" = 1 ] && echo "  - install llama.cpp so this device can hold part of an AI model (SWARM_LLAMA=0 to skip)"
 [ "$AUTOSTART" = 1 ] && echo "  - start it on boot, and keep it updated from the hub"
-echo "It runs in userspace only, backs off when you use the device or the battery is low."
+[ "$CODE_WORKER" = 1 ] && echo "  - accept code written by your AI tools (sandboxed by Android on phones; CODE_WORKER=0 to refuse)"
+echo "It runs in userspace only, backs off when you use the device, runs hot, or the battery is low."
 echo ""
 
 PY=""
@@ -141,6 +145,8 @@ def has_vulkan():
     return False
 arm = machine in ("aarch64", "arm64")
 if termux or (system == "Linux" and "android" in platform.platform().lower()):
+    if not arm:
+        sys.exit("no prebuilt llama.cpp for Android on " + machine + "; skipping (the agent still works)")
     wants = ["bin-android-arm64.tar.gz"]
 elif system == "Darwin":
     wants = ["bin-macos-arm64.tar.gz"] if arm else ["bin-macos-x64.tar.gz"]
@@ -198,6 +204,7 @@ fi
 ARGS="--work --self-update --log $DIR/agent.log"
 if [ "$DEDICATED" = 1 ]; then ARGS="$ARGS --dedicated"; fi
 if [ "$IS_TERMUX" = 1 ] && [ "$DEDICATED" != 0 ]; then ARGS="--work --self-update --dedicated --log $DIR/agent.log"; fi
+if [ "$CODE_WORKER" = 1 ]; then ARGS="$ARGS --code-worker"; fi
 
 # stop an earlier copy so the new one owns the node
 pkill -f "[s]warm-agent.pyz" 2>/dev/null || true
@@ -278,6 +285,7 @@ POWERSHELL_TEMPLATE = r'''# Swarm joiner (Windows). Running this is your consent
 # Options: $env:SWARM_DEDICATED=1 keep working while you use the PC
 #          $env:SWARM_AUTOSTART=0 do not start at logon
 #          $env:SWARM_LLAMA=0 do not install llama.cpp
+#          $env:SWARM_CODE_WORKER=1 accept code written by your AI tools
 $ErrorActionPreference = 'Stop'
 $Hub = '__HUB__'
 $Token = '__TOKEN__'
@@ -364,6 +372,7 @@ if ($Llama -eq '1') {
 $Log = Join-Path $Dir 'agent.log'
 $AgentArgs = "--work --self-update --log ""$Log"""
 if ($Dedicated -eq '1') { $AgentArgs = "$AgentArgs --dedicated" }
+if ($env:SWARM_CODE_WORKER -eq '1') { $AgentArgs = "$AgentArgs --code-worker" }
 
 # stop an earlier copy (and its watchdog) so the new one owns the node
 Get-CimInstance Win32_Process -Filter "Name like 'wscript%' or Name like 'python%'" -ErrorAction SilentlyContinue |

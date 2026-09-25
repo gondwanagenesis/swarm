@@ -156,6 +156,27 @@ def _model_rows(inference: Any) -> str:
     return "".join(rows)
 
 
+def _holo_line(inference: Any) -> str:
+    """Who would take over if this hub died (holographic failover)."""
+    hub = getattr(inference, "hub", None)
+    holo = getattr(hub, "holo", None)
+    if holo is None:
+        return ""
+    try:
+        succ = holo.successors()
+    except Exception:
+        return ""
+    names = ", ".join(html.escape(str(s.get("hostname") or s["node_id"][:8])) for s in succ) or \
+        '<span class="warn">none yet - add a dedicated always-on node</span>'
+    note = ""
+    if holo.demoted:
+        note = f' &middot; <span class="err">stepped aside for {html.escape(str(holo.demoted.get("moved_to")))}</span>'
+    return (
+        f'<div class="meta">swarm <span class="mono">{html.escape(holo.swarm_id)}</span> &middot; epoch {holo.epoch}'
+        f" &middot; successors if this hub dies: {names}{note}</div>"
+    )
+
+
 def render_dashboard(registry: Registry, queue: Optional[WorkQueue] = None, inference: Any = None) -> str:
     nodes = registry.list_nodes()
     links = registry.list_links()
@@ -245,6 +266,7 @@ def render_dashboard(registry: Registry, queue: Optional[WorkQueue] = None, infe
 <h1>Swarm &mdash; measured, not declared</h1>
 <div class="meta">values shown with their trust tier; &mdash; means "we could not measure it" &middot; <a href="/api/fleet-power" style="color:#3cc492">/api/fleet-power</a>
 &middot; <a href="/join" style="color:#3cc492;font-weight:600">+ add a device</a> &middot; OpenAI-compatible API at <span class="mono">/v1</span> (owner key = API key)</div>
+{_holo_line(inference)}
 <h2>Models</h2>
 <table><tr><th>Model</th><th>Kind</th><th>Size</th><th>Held by</th><th>Serving</th></tr>
 {_model_rows(inference) or '<tr><td colspan="5" class="none">No servable models yet. Nodes report Ollama models automatically; drop GGUF files in ~/.swarm/models on a node with llama.cpp.</td></tr>'}

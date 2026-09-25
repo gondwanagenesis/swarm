@@ -22,7 +22,7 @@ jobs:
         run: python -m pip install --upgrade pip && python -m pip install pytest ruff
       - name: Lint
         run: ruff check swarm/ scripts/ tests/
-      - name: Stdlib import gate (agent-side packages)
-        run: python scripts/check_stdlib_imports.py swarm/core swarm/probe swarm/bench swarm/agent swarm/transport swarm/integrator
+      - name: Stdlib import gate (the whole swarm - holographic)
+        run: python scripts/check_stdlib_imports.py swarm
       - name: Tests
         run: python -m pytest tests/ -x --tb=short -q

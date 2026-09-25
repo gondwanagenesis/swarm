@@ -52,7 +52,7 @@ from ._sync import synchronized
 MIB = 1024 * 1024
 GIB = 1024 * MIB
 
-ONLINE_WINDOW_S = 90.0
+ONLINE_WINDOW_S = float(os.environ.get("SWARM_ONLINE_WINDOW_S", "90"))
 DEFAULT_CTX = 4096
 RPC_BASE_PORT = 50052
 SERVER_BASE_PORT = 8090
@@ -79,6 +79,15 @@ CREATE TABLE IF NOT EXISTS services (
     updated_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_services_node ON services(node_id, desired);
+CREATE TABLE IF NOT EXISTS model_speed (
+    model TEXT,
+    head_node_id TEXT,
+    mode TEXT,
+    tps_ewma REAL,
+    samples INTEGER,
+    updated_at REAL,
+    PRIMARY KEY (model, head_node_id, mode)
+);
 CREATE TABLE IF NOT EXISTS deployments (
     model TEXT PRIMARY KEY,
     state TEXT,
@@ -111,12 +120,17 @@ def model_aliases(name: str) -> List[str]:
     return out
 
 
-def usable_bytes(free: Optional[int], kind: str) -> int:
+def usable_bytes(free: Optional[int], kind: str, dedicated: bool = False) -> int:
     """Free memory minus a reserve for the host. The machine is yours first:
-    RAM keeps max(2 GiB, 25%) back; accelerator memory max(512 MiB, 10%)."""
+    RAM keeps max(2 GiB, 25%) back; accelerator memory max(512 MiB, 10%).
+    A DEDICATED machine (an old phone on a charger, a closet box) has no one
+    to protect but its own OS: RAM keeps max(512 MiB, 15%)."""
     if not free or free <= 0:
         return 0
-    reserve = max(2 * GIB, int(free * 0.25)) if kind == "cpu" else max(512 * MIB, int(free * 0.1))
+    if kind == "cpu":
+        reserve = max(512 * MIB, int(free * 0.15)) if dedicated else max(2 * GIB, int(free * 0.25))
+    else:
+        reserve = max(512 * MIB, int(free * 0.10))
     return max(0, int(free) - reserve)
 
 
@@ -175,7 +189,7 @@ def node_capacity(node: Dict[str, Any]) -> Tuple[int, str, List[Dict[str, Any]]]
     if gpus:
         per = [dict(d, usable=usable_bytes(d["free_bytes"], "gpu")) for d in gpus]
         return sum(d["usable"] for d in per), "gpu", per
-    return usable_bytes(node.get("ram_free_bytes"), "cpu"), "cpu", []
+    return usable_bytes(node.get("ram_free_bytes"), "cpu", bool(node.get("dedicated"))), "cpu", []
 
 
 def plan_llama(
@@ -213,7 +227,13 @@ def plan_llama(
     for h in heads:
         cap, kind, per = node_capacity(h)
         scored.append((cap, 1 if kind == "gpu" else 0, h, kind, per))
-    scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    need_probe, _ = estimate_need(size, ctx)
+    # Among heads that can hold the model alone, prefer the one MEASURED
+    # fastest on it before (tokens/s from real requests); capacity otherwise.
+    scored.sort(
+        key=lambda t: (t[0] >= need_probe, float(t[2].get("measured_tps") or 0.0), t[0], t[1]),
+        reverse=True,
+    )
     head_cap, _, head, head_kind, head_devs = scored[0]
 
     base = {
@@ -222,8 +242,15 @@ def plan_llama(
         "need_basis": need_basis,
         "ctx": ctx,
         "n_layers": n_layers or None,
-        "head": {"node_id": head["node_id"], "hostname": head.get("hostname"), "kind": head_kind,
-                 "usable_bytes": head_cap},
+        "head": {
+            "node_id": head["node_id"],
+            "hostname": head.get("hostname"),
+            "kind": head_kind,
+            "usable_bytes": head_cap,
+            # the accelerators the plan counted on; the head is told to use
+            # exactly these (plus its RPC helpers), never an unplanned GPU
+            "devices": [d["id"] for d in head_devs] if head_kind == "gpu" else [],
+        },
         "force_shard": bool(force_shard),
     }
 
@@ -368,10 +395,11 @@ class Inference:
     """Runtime catalog + deployments + desired services. Shares the hub's
     sqlite connection and RLock like every other hub organ."""
 
-    def __init__(self, conn: sqlite3.Connection, lock: threading.RLock, registry: Any) -> None:
+    def __init__(self, conn: sqlite3.Connection, lock: threading.RLock, registry: Any, hub: Any = None) -> None:
         self.conn = conn
         self._lock = lock
         self.registry = registry
+        self.hub = hub
         self._cv = threading.Condition()
         self._version: Dict[str, int] = {}
         with self._lock:
@@ -577,15 +605,55 @@ class Inference:
         d["services"] = self.list_services(model)
         return d
 
-    def _node_view(self, node: Dict[str, Any]) -> Dict[str, Any]:
+    def _node_view(self, node: Dict[str, Any], model: Optional[str] = None) -> Dict[str, Any]:
         llama = node["data"].get("llama") or {}
+        extra = {}
+        holo = getattr(getattr(self, "hub", None), "holo", None)
+        if holo is not None:
+            extra = holo.node_extra(node["node_id"])
         return {
             "node_id": node["node_id"],
             "hostname": node["hostname"],
             "devices": llama.get("devices") if "llama_server" in llama else None,
             "ram_free_bytes": node.get("ram_free_bytes"),
             "build": llama.get("build"),
+            "dedicated": bool(extra.get("dedicated")),
+            "measured_tps": self.speed(model, node["node_id"], "single") if model else None,
         }
+
+    # -- measured speed (C5: placement learns from real runs) -----------------
+
+    @synchronized
+    def record_speed(self, dep: Dict[str, Any], tps: float) -> None:
+        model = dep.get("model")
+        head = dep.get("head_node_id")
+        mode = (dep.get("plan") or {}).get("mode") or "single"
+        if not model or not head or tps <= 0:
+            return
+        row = self.conn.execute(
+            "SELECT tps_ewma, samples FROM model_speed WHERE model=? AND head_node_id=? AND mode=?",
+            (model, head, mode),
+        ).fetchone()
+        if row is None:
+            ewma, samples = tps, 1
+        else:
+            ewma, samples = 0.7 * float(row["tps_ewma"]) + 0.3 * tps, int(row["samples"]) + 1
+        self.conn.execute(
+            "INSERT OR REPLACE INTO model_speed (model, head_node_id, mode, tps_ewma, samples, updated_at) VALUES (?,?,?,?,?,?)",
+            (model, head, mode, ewma, samples, time.time()),
+        )
+        self.conn.commit()
+
+    @synchronized
+    def speed(self, model: Optional[str], head: str, mode: str) -> Optional[float]:
+        row = self.conn.execute(
+            "SELECT tps_ewma FROM model_speed WHERE model=? AND head_node_id=? AND mode=?", (model, head, mode)
+        ).fetchone()
+        return float(row["tps_ewma"]) if row else None
+
+    @synchronized
+    def speeds(self) -> List[Dict[str, Any]]:
+        return [dict(r) for r in self.conn.execute("SELECT * FROM model_speed ORDER BY model").fetchall()]
 
     def plan(self, model_name: str, force_shard: bool = False, ctx: int = DEFAULT_CTX) -> Dict[str, Any]:
         entry = self.resolve(model_name, kind="chat")
@@ -594,7 +662,7 @@ class Inference:
         nodes = self.online_runtime_nodes()
         holders = {n["node_id"] for n in entry["nodes"]}
         heads = [
-            self._node_view(n)
+            self._node_view(n, entry["name"])
             for n in nodes
             if n["node_id"] in holders and "llama_server" in (n["data"].get("llama") or {})
         ]
@@ -677,9 +745,15 @@ class Inference:
         head = nodes.get(plan["head"]["node_id"])
         if head is None:
             return
+        # --rpc order MUST follow the plan's participant order: the tensor
+        # split vector is positional (head devices first, then each endpoint).
+        by_node = {
+            svc["node_id"]: svc for svc in self.list_services(model) if svc["kind"] == "llama_rpc" and svc["desired"]
+        }
         rpc_endpoints = []
-        for svc in self.list_services(model):
-            if svc["kind"] == "llama_rpc" and svc["desired"]:
+        for p in plan.get("participants") or []:
+            svc = by_node.get(p["node_id"]) if p.get("role") == "rpc" else None
+            if svc is not None:
                 rpc_endpoints.append(f"{svc['spec']['bind']}:{svc['spec']['port']}")
         spec = {
             "kind": "llama_server",
@@ -692,6 +766,9 @@ class Inference:
         }
         if plan.get("tensor_split"):
             spec["tensor_split"] = plan["tensor_split"]
+        head_devices = list((plan.get("head") or {}).get("devices") or [])
+        rpc_devices = [f"RPC{i}" for i in range(len(rpc_endpoints))]
+        spec["devices"] = (head_devices + rpc_devices) or ["none"]
         self._add_service(model, head["node_id"], spec)
 
     @synchronized

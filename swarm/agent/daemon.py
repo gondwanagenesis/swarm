@@ -39,7 +39,7 @@ from ..transport.link import LinkProber
 from .adapter_runtime import run_spec, task_adapter_spec
 from .ops import OPS
 
-HEARTBEAT_SECONDS = 30.0
+HEARTBEAT_SECONDS = float(os.environ.get("SWARM_HEARTBEAT_S", "30"))
 IDLE_BACKOFF_MAX = 10.0
 LEASE_RENEW_FRACTION = 1.0 / 3.0
 WELFARE_CHECK_S = 30.0
@@ -57,6 +57,9 @@ def _local_addresses() -> List[str]:
     """Addresses peers might reach this machine on: the LAN route and, if
     present, the Tailscale route. Found by asking the kernel which interface
     would carry traffic (UDP connect; no packet is sent). Never loopback."""
+    override = os.environ.get("SWARM_ADVERTISE_ADDRESSES")
+    if override is not None:  # simulations pin this (empty = loopback only)
+        return [a.strip() for a in override.split(",") if a.strip()]
     found: List[str] = []
     for target in (("8.8.8.8", 53), ("100.100.100.100", 53)):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -71,6 +74,49 @@ def _local_addresses() -> List[str]:
         finally:
             sock.close()
     return found
+
+
+# Emulated device profiles, for simulating a whole fleet on one machine. The
+# numbers are DECLARED, so every emulated node says so: an anomaly on its
+# profile and `emulated` on its registration, shown on the dashboard.
+EMULATED_PROFILES: Dict[str, Dict[str, Any]] = {
+    "phone": {"os": "android", "arch": "aarch64", "ram_free": 3 * 1024**3, "cores": 8, "battery": "85:ac", "dedicated": True},
+    "old-phone": {"os": "android", "arch": "armv7l", "ram_free": int(1.5 * 1024**3), "cores": 4, "battery": "70:ac", "dedicated": True},
+    "pi": {"os": "linux", "arch": "aarch64", "ram_free": 3 * 1024**3, "cores": 4, "dedicated": True},
+    "gpu-box": {
+        "os": "linux", "arch": "x86_64", "ram_free": 24 * 1024**3, "cores": 12, "dedicated": True,
+        "devices": [{"id": "Vulkan0", "name": "Emulated RTX 3060", "total_bytes": 12 * 1024**3, "free_bytes": 11 * 1024**3}],
+    },
+    "laptop": {"os": "windows", "arch": "x86_64", "ram_free": 8 * 1024**3, "cores": 8, "battery": "60:battery"},
+    "thin-laptop": {"os": "windows", "arch": "x86_64", "ram_free": 4 * 1024**3, "cores": 4, "battery": "70:ac"},
+    "server": {"os": "linux", "arch": "x86_64", "ram_free": 6 * 1024**3, "cores": 2, "dedicated": True},
+}
+
+
+def apply_emulation(kind: str, payload: Dict[str, Any]) -> None:
+    prof = EMULATED_PROFILES[kind]
+    p = payload["profile"]
+    p["hostname"] = f"{p.get('hostname') or 'node'}-emu-{kind}"
+    p["os"] = prof["os"]
+    p["arch"] = prof["arch"]
+    p.setdefault("memory", {})["free_bytes"] = prof["ram_free"]
+    p["memory"]["total_bytes"] = int(prof["ram_free"] * 1.6)
+    p.setdefault("anomalies", []).append(
+        {
+            "source": "emulation",
+            "message": f"emulated '{kind}' device: memory/devices below are declared for simulation, not measured",
+            "severity": "warning",
+        }
+    )
+    llama = (payload.get("inference") or {}).get("llama") or {}
+    if llama and "llama_server" in llama:
+        llama["devices"] = list(prof.get("devices") or [])
+    payload["emulated"] = kind
+    if prof.get("dedicated"):
+        payload["dedicated"] = True
+    # The welfare gate must judge the EMULATED device, not the host running
+    # the simulation (a laptop at 19% would park the whole emulated fleet).
+    os.environ["SWARM_EMULATE_BATTERY"] = str(prof.get("battery") or "100:ac")
 
 
 class _KeyStore:
@@ -136,6 +182,9 @@ class Agent:
         self_update: bool = False,
         dedicated: bool = False,
         services: bool = False,
+        code_worker: bool = False,
+        emulate: Optional[str] = None,
+        hub_port: int = 8777,
     ) -> None:
         parsed = urlparse(hub_url if "://" in hub_url else "http://" + hub_url)
         self.hub_host = parsed.hostname or "127.0.0.1"
@@ -150,8 +199,15 @@ class Agent:
         self.last_bench_at = 0.0
         self.ignore_welfare = ignore_welfare
         self.self_update = self_update
-        self.dedicated = dedicated
+        self.dedicated = dedicated or bool(emulate and EMULATED_PROFILES.get(emulate, {}).get("dedicated"))
         self.services_enabled = services
+        self.code_worker = code_worker
+        self.emulate = emulate
+        self.hub_port_offer = hub_port
+        self.holo: Any = None
+        self._hub_ok_at = time.time()
+        self._hub_proc: Any = None
+        self._last_register_payload: Optional[Dict[str, Any]] = None
         self.hub_key = f"{self.hub_host}:{self.hub_port}"
         self.keys = _KeyStore()
         self.node_key: Optional[str] = None
@@ -178,6 +234,16 @@ class Agent:
             if resp.status == 401 and path != "/api/register":
                 # The hub no longer knows our key (revoked, or a fresh hub db).
                 self.registered = False
+            if resp.status == 409:
+                # This hub stepped aside for a newer one (holographic failover).
+                try:
+                    moved = json.loads(raw.decode("utf-8"))
+                except Exception:
+                    moved = {}
+                target = moved.get("moved_to")
+                if target and int(moved.get("epoch") or 0) >= (self.holo.epoch if self.holo else 0):
+                    self.switch_hub(str(target))
+                return None
             if resp.status != 200:
                 if resp.status in (401, 403):
                     try:
@@ -228,7 +294,14 @@ class Agent:
             "inference": self.inference,
             "addresses": _local_addresses(),
             "dedicated": self.dedicated,
+            "code_worker": self.code_worker,
+            "can_hub": _can_run_hub(),
+            "hub_port": self.hub_port_offer,
+            "ops": ["*"],
         }
+        if self.emulate:
+            apply_emulation(self.emulate, payload)
+        self._last_register_payload = payload
         # A key from an earlier run lets us re-register without a token (the
         # token may have expired long ago; the key is the standing consent).
         self.node_key = self.keys.get(self.hub_key, self.node_id) or self.node_key
@@ -238,6 +311,7 @@ class Agent:
             resp = self._post("/api/register", payload, timeout=30.0)
         if resp and resp.get("ok"):
             self.registered = True
+            self._hub_ok_at = time.time()
             if resp.get("node_key"):
                 self.node_key = str(resp["node_key"])
                 self.keys.put(self.hub_key, self.node_id, self.node_key)
@@ -302,7 +376,7 @@ class Agent:
         except Exception:
             watcher = None
         try:
-            while True:
+            while not self._stop.is_set():
                 welfare = None
                 try:
                     from .welfare import battery_state, user_idle_seconds
@@ -311,17 +385,123 @@ class Agent:
                 except Exception:
                     welfare = None
                 resp = self._post("/api/heartbeat", {"node_id": self.node_id, "welfare": welfare})
-                if resp is None or not resp.get("ok") or not self.registered:
+                if resp is not None and resp.get("ok") and self.registered:
+                    self._on_hub_alive(resp)
+                    if self.do_bench and (time.time() - self.last_bench_at) > self.rebench_interval:
+                        run_floor_benchmarks()
+                        self.last_bench_at = time.time()
+                        self._post("/api/heartbeat", {"node_id": self.node_id})
+                elif resp is not None or self.last_status in (401, 403):
+                    # hub is up but does not know us (fresh db, revoked key)
                     self.registered = False
-                    self.probe_and_register()
-                elif self.do_bench and (time.time() - self.last_bench_at) > self.rebench_interval:
-                    run_floor_benchmarks()
-                    self.last_bench_at = time.time()
-                    self._post("/api/heartbeat", {"node_id": self.node_id})
-                time.sleep(HEARTBEAT_SECONDS)
+                    self.quick_register() or self.probe_and_register()
+                else:
+                    self._on_hub_silent()
+                self._supervise_local_hub()
+                self._stop.wait(HEARTBEAT_SECONDS)
         finally:
             if watcher is not None:
                 watcher.stop()
+
+    # -- holographic hub: follow, replicate, fail over ---------------------------
+
+    @property
+    def hub_url(self) -> str:
+        return f"http://{self.hub_host}:{self.hub_port}"
+
+    def _holo_state(self) -> Any:
+        if self.holo is None and self.node_id:
+            from .holo import HoloState
+
+            self.holo = HoloState(self.node_id)
+        return self.holo
+
+    def _node_headers(self) -> Dict[str, str]:
+        if self.node_id and self.node_key:
+            return {"X-Swarm-Node": self.node_id, "X-Swarm-Node-Key": self.node_key}
+        return {}
+
+    def _on_hub_alive(self, resp: Dict[str, Any]) -> None:
+        self._hub_ok_at = time.time()
+        state = self._holo_state()
+        if state is None:
+            return
+        info = resp.get("holo")
+        if info:
+            state.update(info, self.hub_url)
+            from .holo import fetch_replica
+
+            if fetch_replica(state, self.hub_url, self._node_headers()):
+                print(f"[holo] replica refreshed ({state.data.get('replica_sha256', '')[:12]})", flush=True)
+
+    def _on_hub_silent(self) -> None:
+        state = self._holo_state()
+        if state is None or not state.successors:
+            return
+        dead_for = time.time() - self._hub_ok_at
+        from .holo import choose_hub, failover_after_s, promote
+
+        if dead_for < failover_after_s():
+            return
+        decision = choose_hub(state, dead_for)
+        if decision["action"] == "switch":
+            print(f"[holo] hub silent {dead_for:.0f}s; following successor {decision['url']}", flush=True)
+            self.switch_hub(decision["url"])
+        elif decision["action"] == "promote":
+            entry = decision["entry"]
+            print(f"[holo] hub silent {dead_for:.0f}s; this node is successor #{entry.get('rank')} -- becoming the hub at {entry['url']}", flush=True)
+            proc = promote(state, entry)
+            if proc is not None:
+                self._hub_proc = proc
+                self.switch_hub(entry["url"])
+            else:
+                print("[holo] promotion impossible (no replica on disk); waiting for another successor", flush=True)
+
+    def _supervise_local_hub(self) -> None:
+        """A hub this node promoted is the swarm's brain now: if it dies,
+        start it again from its own database (same epoch)."""
+        proc = self._hub_proc
+        if proc is None or proc.poll() is None or self._stop.is_set():
+            return
+        state = self._holo_state()
+        from .holo import launch_hub
+
+        print("[holo] the hub this node runs exited; restarting it on its own database", flush=True)
+        entry = {"url": state.data.get("hub_url") or self.hub_url}
+        self._hub_proc = launch_hub(state, entry, state.epoch)
+
+    def switch_hub(self, url: str) -> None:
+        parsed = urlparse(url if "://" in url else "http://" + url)
+        new_host, new_port = parsed.hostname or self.hub_host, parsed.port or 8777
+        if (new_host, new_port) == (self.hub_host, self.hub_port):
+            return
+        self.hub_host, self.hub_port = new_host, new_port
+        self.hub_key = f"{self.hub_host}:{self.hub_port}"
+        if self.node_key:
+            self.keys.put(self.hub_key, self.node_id, self.node_key)
+        self._hub_ok_at = time.time()
+        state = self._holo_state()
+        if state is not None:
+            state.data["hub_url"] = self.hub_url
+            state.save()
+        self.quick_register()
+
+    def quick_register(self) -> bool:
+        """Re-send the last registration (no re-probe) — used after a hub
+        switch or when a hub forgot us. The node key is the consent."""
+        payload = self._last_register_payload
+        if not payload:
+            return False
+        payload = dict(payload, addresses=_local_addresses())
+        resp = self._post("/api/register", payload, timeout=30.0)
+        if resp and resp.get("ok"):
+            self.registered = True
+            self._hub_ok_at = time.time()
+            if resp.get("node_key"):
+                self.node_key = str(resp["node_key"])
+                self.keys.put(self.hub_key, self.node_id, self.node_key)
+            return True
+        return False
 
     def _on_devices_changed(self, added: list, removed: list) -> None:
         """New or removed hardware => re-register (idempotent upsert) so the
@@ -652,7 +832,26 @@ def _redirect_output(path: str, max_bytes: int = 5 * 1024 * 1024) -> None:
         pass
 
 
+def _can_run_hub() -> bool:
+    """Does this agent carry the hub (holographic: every bundle does)?"""
+    try:
+        import importlib.util
+
+        return importlib.util.find_spec("swarm.hub.server") is not None
+    except Exception:
+        return False
+
+
 def main(argv: Optional[List[str]] = None) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if "--run-hub" in raw:
+        # The agent file carries the whole swarm: this runs a hub from it
+        # (holographic failover, or a phone chosen to coordinate).
+        raw.remove("--run-hub")
+        from ..hub.server import main as hub_main
+
+        hub_main(raw)
+        return 0
     cfg = bundled_config()
     parser = argparse.ArgumentParser(description="Swarm node agent")
     parser.add_argument(
@@ -704,6 +903,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="append output to this file (used by autostart, where there is no console)",
     )
     parser.add_argument(
+        "--code-worker",
+        action="store_true",
+        default=bool(cfg.get("code_worker")),
+        help="accept code an AI wrote (MCP tools route it only to nodes that opt in)",
+    )
+    parser.add_argument(
+        "--emulate",
+        choices=sorted(EMULATED_PROFILES),
+        default=None,
+        help="SIMULATION: report a declared device profile (phone, pi, gpu-box...) instead of this machine",
+    )
+    parser.add_argument("--hub-port", type=int, default=8777, help="port this node would serve a hub on if promoted")
+    parser.add_argument(
         "--normal-priority",
         action="store_true",
         help="do not lower this agent's CPU priority (default: yield to the owner's apps)",
@@ -748,6 +960,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         self_update=args.self_update,
         dedicated=args.dedicated,
         services=not args.no_services,
+        code_worker=args.code_worker,
+        emulate=args.emulate,
+        hub_port=args.hub_port,
     )
     t0 = time.time()
     ok = agent.probe_and_register()

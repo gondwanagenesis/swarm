@@ -15,7 +15,6 @@ import time
 from typing import Any
 
 from ..agent.join_scripts import build_seed_kit, render_posix, render_powershell
-from .agentbundle import build_agent_pyz
 
 JOIN_TOKEN_TTL_S = 7 * 86400.0
 KIT_TOKEN_TTL_S = 30 * 86400.0
@@ -87,7 +86,7 @@ def handle_join(hub: Any, handler: Any, path: str) -> None:
     elif path == "/join.ps1":
         _send_text(handler, render_powershell(base, token, dedicated, llama_tag=tag))
     elif path == "/join/seed-kit.zip":
-        bundle = build_agent_pyz(config={"hub": base, "token": token, "dedicated": dedicated})
+        bundle = hub.bundle_for({"hub": base, "token": token, "dedicated": dedicated})
         expires = time.strftime("%Y-%m-%d", time.localtime(float(record["expires_at"])))
         data = build_seed_kit(base, token, bundle, expires, dedicated, llama_tag=tag)
         handler.send_response(200)
@@ -154,6 +153,11 @@ invite links expire in 7 days (seed kit: 30). Click a command to copy it.</p>
 <li>Android settings &rarr; Apps &rarr; Termux &rarr; Battery &rarr; <i>Unrestricted</i>, so Android does not kill it.</li>
 </ol>
 <p class="dim">GPU/pooled-model work on a phone: <code>pkg install llama-cpp</code> gives it an RPC worker the swarm will use automatically.</p></section>
+
+<section><h2>iPhone, iPad, tablets, smart TVs - anything with a browser</h2>
+<p class="dim">Open this link on the device and tap <b>Start</b>. It lends spare cycles while the page is open
+(small, checkable math jobs only), pauses when hidden or on low battery, and stops when the tab closes.</p>
+<pre>{e(base)}/worker?token={e(tok)}</pre></section>
 
 <section><h2>Seed kit - USB sticks, SD cards, and devices that cannot compute</h2>
 <p class="dim">A zip with the agent and a double-click joiner for every OS, invite baked in. Copy it onto a USB stick and plug it into any PC.

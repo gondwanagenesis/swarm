@@ -44,11 +44,20 @@ as the work it describes.
 | H3 | Crashed agent comes back by itself on every platform | 🟡 | systemd `Restart=always`, LaunchAgent `KeepAlive`; watchdog loops for Windows (VBS), Termux, cron, plain start. Not yet crash-tested live |
 | H4 | A restart can never double a node | ✅ | Single-instance lock (`tests/test_invisible.py`) |
 | H5 | A model deployment whose participant dies is failed and re-placed on the next request | 🟡 | `tick()` logic + tests; not killed live |
-| H6 | Every node carries the WHOLE swarm (hub code too — it is stdlib) | ⬜ | Agent bundle ships core/probe/bench/transport/agent only |
-| H7 | Hub state is replicated to several nodes continuously | ⬜ | `/api/backup` snapshot exists; nothing distributes it |
-| H8 | Hub loss → a pre-agreed successor restarts the hub from the latest replica; nodes re-attach on their own | ⬜ | Needs H6 + H7 + a successor list the hub publishes (Tailscale addresses) and mDNS on LANs |
-| H9 | Owner key survives a hub loss without being copied in plaintext to every node | ⬜ | Store only its hash in replicated state; owner keeps the key |
-| H10 | Nothing in the swarm depends on one cloud service being up | 🟡 | GitHub is used only at join time (llama.cpp download); a seed kit can carry everything offline except llama.cpp |
+| H6 | Every node carries the WHOLE swarm (hub code too — it is stdlib) | ✅ | Agent file ships hub + integrator + CLI + MCP; CI gates the whole package stdlib-only; `tests/test_agentbundle.py` runs a hub FROM the agent file |
+| H7 | Hub state is replicated to several nodes continuously | ✅ | Up to 3 ranked successors pull a pruned, gzipped, hashed snapshot when it changes (`/api/replica`); `tests/test_holo.py` |
+| H8 | Hub loss → a successor restarts the hub from the latest replica; nodes re-attach on their own | ✅ | `tests/test_holo.py::test_hub_failover_end_to_end`: real hub killed, successor promotes a NEW hub process at epoch 2, the other node follows, new work completes. Old hub steps aside (HTTP 409 `moved_to`) on seeing a higher epoch |
+| H9 | Owner key survives a hub loss without being copied in plaintext to every node | ✅ | Replicas carry only its sha256; a restored hub verifies against the hash (`test_identity_is_minted_once_and_replicates`) |
+| H10 | Nothing in the swarm depends on one cloud service being up | ✅ | GitHub is touched only at join time (llama.cpp download); hub, agents, failover, updates all run inside the fleet |
+
+## J. Everything tested, emulated, simulated
+
+| # | Requirement | Status | Evidence / gap |
+|---|---|---|---|
+| J1 | Unit + integration suite across Windows/macOS/Linux × Python 3.9/3.12 | ✅ | GitHub Actions matrix; stdlib gate covers the whole package |
+| J2 | Emulated devices: phone, old phone, Pi, GPU box, laptop, thin laptop, server — every emulated node says so | ✅ | `--emulate`; declared numbers flagged as an anomaly and `emulated` on registration |
+| J3 | Whole-fleet simulation with chaos (devices die, a pooled helper dies, the hub dies) | see `docs/SIMULATION.md` | `scripts/simulate_fleet.py`: real processes, secure hub, real llama.cpp |
+| J4 | Real joiners on emulated Linux / Android devices | see run log | Docker (Linux) and termux-docker (Android) containers running the real one-line joiner |
 
 ## I. Invisible & harmless (priorities 2 and 3)
 
@@ -61,7 +70,7 @@ as the work it describes.
 | I5 | Logs are bounded (rotate at 5 MB) | ✅ | `--log` rotation |
 | I6 | Uninstall removes only what the swarm added | ✅ | Joiners' leave line (hub files never touched) |
 | I7 | Joiners never replace software the owner installed (swarm copies live in `~/.swarm`) | ✅ | llama.cpp goes to `~/.swarm/llama`; the owner's winget copy was untouched |
-| I8 | Thermal awareness (back off when a phone runs hot) | ⬜ | Battery yes; temperature not read yet |
+| I8 | Thermal awareness (back off when a phone runs hot) | ✅ | Battery ≥ 43 °C or CPU ≥ 85 °C parks work (Linux/Android sysfs; unknown elsewhere); `test_hot_device_rests` |
 
 ## A. Joining — "plug it in, click accept, done"
 
@@ -77,7 +86,7 @@ as the work it describes.
 | A8 | A device that cannot compute can still *carry* the seed and serve it over Wi-Fi | 🟡 | `swarm-agent.pyz --seed` serves the kit + joiners on :8788; not yet run on a real phone |
 | A9 | USB autorun ("plug in and it starts") | ⛔ | Every modern OS blocks it (Windows since 2011). Nearest honest version: double-click `JOIN-*` on the stick |
 | A10 | Android without installing Termux first | ⛔ | Android forbids apps installing themselves. One-time Termux install, then one line |
-| A11 | iPhone / iPad as a worker | ⛔ now · ⬜ later | iOS kills background Python. Later: a browser worker (open a URL; WebGPU does the math) |
+| A11 | iPhone / iPad as a worker | ✅ via browser | Background Python is impossible on iOS; the browser worker (E8) is the honest alternative |
 | A12 | Consent is never bypassed: nothing joins without its owner running something | ✅ | Tokens required off-loopback; `/invite` no longer mints tokens for strangers (bug fixed, test-pinned) |
 
 ## B. Security
@@ -91,8 +100,8 @@ as the work it describes.
 | B5 | llama.cpp `rpc-server` (no auth by design) bound to one specific address, never 0.0.0.0 | ✅ | Validated spec; live VPS rpc-server bound to 100.81.227.46 |
 | B6 | Hub never names a binary or a path on a node; agent builds every command line itself | ✅ | `tests/test_services.py` hostile-spec cases |
 | B7 | Traffic encrypted in transit | ✅ via Tailscale | The hub speaks plain HTTP; Tailscale (WireGuard) is the encryption. Documented, deliberate |
-| B8 | AI-written code runs only on nodes that opt in as code workers (phones in Termux are Android-sandboxed) | ⬜ | Today any worker runs `map` code as its own user |
-| B9 | Signed agent bundles | ⬜ | Today: sha256 verified over the node-authenticated channel |
+| B8 | AI-written code runs only on nodes that opt in as code workers (phones in Termux are Android-sandboxed) | ✅ | `--code-worker` → `role:code-worker`; MCP tools target only that class and refuse when none is online (`test_ai_code_runs_only_on_opted_in_code_workers`) |
+| B9 | Signed agent bundles | ✅ | Hub signs each update offer with HMAC(sha256(node key)); keyed nodes refuse unsigned or wrongly-signed offers (`test_updates_must_be_signed_with_the_node_key`) |
 
 ## C. Measurement & honesty (the laws)
 
@@ -102,7 +111,7 @@ as the work it describes.
 | C2 | Nothing scheduled on declared numbers; model placement uses measured free memory only, overhead labelled ESTIMATED | ✅ | Every plan carries `need_basis`; tests |
 | C3 | Never claim a deployment that is not really running as planned | ✅ | Found live: a head that silently dropped its helper was reported "pooled". Now the agent reads llama.cpp's log and fails it with the reason |
 | C4 | Failures are visible: failed tasks retried, then closed as failed with the error kept | ✅ | Was: errors silently stored as "done" results. `tests/test_queue_failures.py` |
-| C5 | Placement learns from real runs (tokens/s per deployment feeds the next plan) | ⬜ | Per-op task EWMA exists; model tokens/s is measured but not yet fed back |
+| C5 | Placement learns from real runs (tokens/s per deployment feeds the next plan) | ✅ | Gateway records llama.cpp's measured tokens/s (streaming too); planner prefers the measured-fastest head that fits (`test_measured_speed_picks_the_head`) |
 
 ## D. Work — what the fleet can do
 
@@ -119,8 +128,8 @@ as the work it describes.
 | D9 | **Map**: the owner's Python function across every node, results in input order | ✅ | Live: 24/24 items across laptop + VPS in 4.5 s, 0 failed |
 | D10 | Interactive work jumps the queue; idle nodes long-poll (no nap between polls) | ✅ | Tests (woke in < 5 s) |
 | D11 | Nodes holding model layers take no batch work ("thinking nodes don't do chores") | ✅ | Test |
-| D12 | Cloud fallback in `/v1`: local first, frontier API only if nothing local serves, with budget + kill switch | ⬜ | Brain router lanes exist; not wired into `/v1` |
-| D13 | Brains hand work to small devices: `swarm_run_python` / `swarm_map` as tools (MCP + OpenAI tools) for Claude, OpenCode, Thea, local models | ⬜ | Next build |
+| D12 | Cloud fallback in `/v1`: local first, frontier API only if nothing local serves, with budget + kill switch | ✅ | Armed + enabled + not killed → forwarded, labelled `path: frontier`, daily cap (`test_cloud_lane_is_an_owner_armed_fallback`) |
+| D13 | Brains hand work to small devices: `swarm_run_python` / `swarm_map` as tools (MCP) for Claude, OpenCode, Thea, local models | ✅ | `python -m swarm.mcp` (stdio JSON-RPC): status/models/chat/embed/run_python/map; tested end to end against a live hub + code worker |
 | D14 | Leases renew over HTTP for long tasks | ✅ | Was a 404 (route missing); test-pinned |
 
 ## E. Devices — "everything"
@@ -134,7 +143,7 @@ as the work it describes.
 | E5 | Raspberry Pi / ARM Linux | 🟡 | ubuntu-arm64 release selected by the joiner; untested |
 | E6 | Mac (Metal) | 🟡 | macos-arm64/x64 release; untested |
 | E7 | Carrier-only (USB stick, dead phone) | 🟡 | Seed kit (A7/A8) |
-| E8 | Browser tab (iPhone, tablet, TV) via WebGPU | ⬜ | Later |
+| E8 | Browser tab (iPhone, tablet, TV) | ✅ | `/worker?token=`: joins on one tap, Web Worker compute, op-routed (never gets map/chat), pauses when hidden or on low battery. Live in a real browser: joined, paused itself at 14% battery, and its primesum/hashwork/matmul results were byte-identical to the Python agents' |
 
 ## F. Operations
 
@@ -144,7 +153,7 @@ as the work it describes.
 | F2 | Dashboard: nodes, models, deployments, "+ add a device" | ✅ | `/` and `/join` (owner key, cookie after one `?key=` visit) |
 | F3 | Owner CLI: status / models / chat / deploy / plan / map / join | ✅ | Used for the live run |
 | F4 | Devices back off when used or low on battery; `--dedicated` for compute-only machines | ✅ logic · 🟡 phones | Welfare gate; dedicated keeps battery protection |
-| F5 | Scheduled hub backups | ⬜ | `/api/backup` exists; nothing calls it on a schedule |
+| F5 | Scheduled hub backups | ✅ | Successor replicas ARE continuous off-machine backups; `/api/backup` for manual copies |
 | F6 | Hub shutdown is crash-free | ✅ | Found: closing sqlite under a long-poll thread was an access violation; fixed + test |
 | F7 | Multi-hub federation | ⬜ | Later |
 

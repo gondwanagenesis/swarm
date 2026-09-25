@@ -98,7 +98,6 @@ BASELINE = {
     "shlex",
     "stat",
     "tarfile",
-    "urllib",
     "winreg",
 }
 

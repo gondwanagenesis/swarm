@@ -106,11 +106,15 @@ class HubAuth:
         lock: Optional[threading.RLock] = None,
         secure: bool = False,
         owner_key: Optional[str] = None,
+        owner_key_hash: Optional[str] = None,
     ) -> None:
         self.conn = conn
         self._lock = lock or threading.RLock()
         self.secure = secure
         self.owner_key = owner_key
+        # A hub restored from a replica holds only the HASH of the owner key
+        # (holo.py): the owner's key keeps working, no node ever learned it.
+        self.owner_key_hash = owner_key_hash or (_digest(owner_key) if owner_key else None)
         with self._lock:
             self.conn.executescript(_SCHEMA)
             self.conn.commit()
@@ -134,10 +138,21 @@ class HubAuth:
     def is_owner(self, headers: Mapping[str, Any], query: Mapping[str, Any]) -> bool:
         if not self.secure:
             return True
-        if not self.owner_key:
-            return False
         presented = self.owner_key_from(headers, query)
-        return bool(presented) and hmac.compare_digest(presented, self.owner_key)
+        if not presented:
+            return False
+        if self.owner_key:
+            return hmac.compare_digest(presented, self.owner_key)
+        if self.owner_key_hash:
+            return hmac.compare_digest(_digest(presented), self.owner_key_hash)
+        return False
+
+    def node_key_hash(self, node_id: str) -> Optional[str]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT key_hash, revoked FROM node_keys WHERE node_id=?", (node_id,)
+            ).fetchone()
+        return None if row is None or row["revoked"] else str(row["key_hash"])
 
     # -- nodes ------------------------------------------------------------
 

@@ -41,7 +41,10 @@ plausible-looking lie. Anomalies are recorded, never suppressed.
 
 ## Hard constraints
 
-- `swarm/core`, `swarm/probe`, `swarm/bench`, `swarm/agent`, `swarm/transport`:
+- **The whole `swarm` package: Python standard library only** (holographic:
+  every agent file carries the hub, so every node must be able to run it).
+  Originally this bound only `swarm/core`, `swarm/probe`, `swarm/bench`,
+  `swarm/agent`, `swarm/transport`:
   **Python standard library only.** Every import in these packages must come from
   the stdlib. No exceptions, no "just this one small package." A Termux phone with
   bare CPython 3.9 must be able to run the agent.
@@ -119,6 +122,12 @@ The organism heals itself the way it earns trust: by proof, not permission.
   proxies. Pooling uses fewest-nodes placement (single-stream decode crosses
   every hop, so hops cost more than the slowest stage). Proven live laptop
   GPU + VPS CPU; numbers in REQUIREMENTS.md.
+- **M5.75 (done):** holographic hub — every agent carries the whole swarm;
+  ranked successors hold replicas; a successor promotes itself at a higher
+  epoch when the hub dies; an old hub steps aside. Plus: MCP tools with a
+  code-worker opt-in, the browser worker, the cloud lane as an armed
+  fallback, measured-speed placement, heat protection, signed updates,
+  emulated devices and the whole-fleet simulator (`scripts/simulate_fleet.py`).
 - **M5.5 (done):** zero-touch joining — one-line joiners per platform, seed
   kits, pinned fleet llama.cpp build, self-update by code hash, secure-by-
   default hubs (owner key, node keys, tokens).

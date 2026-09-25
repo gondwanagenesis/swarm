@@ -16,21 +16,29 @@ Routing, cheapest honest path first:
    to a node that holds it. The node calls its own local Ollama. Works
    through NAT (the node pulls; nothing dials in). Streaming is delivered as
    a single SSE chunk — honest about what the path can do.
-3. Anything else: 404 with the list of models that *are* servable, never a
-   silent fallback to some other model.
+3. Not servable locally, and the hub's cloud lane is armed (a frontier API
+   key configured, lane enabled, kill switch off): forwarded to the frontier
+   provider, within a daily request budget, and labelled ``path: frontier``.
+   The fleet is always asked first; the cloud is a fallback the owner turned
+   on, never a silent substitute.
+4. Anything else: 404 with the list of models that *are* servable.
 """
 
 from __future__ import annotations
 
+import contextlib
 import http.client
 import json
 import os
 import time
+import urllib.error
+import urllib.request
 import uuid
 from typing import Any, Dict, List
 from urllib.parse import urlparse
 
 DEPLOY_WAIT_S = float(os.environ.get("SWARM_DEPLOY_WAIT_S", "600"))
+FRONTIER_DAILY_REQUESTS = int(os.environ.get("SWARM_FRONTIER_DAILY_REQUESTS", "200"))
 TASK_WAIT_S = float(os.environ.get("SWARM_TASK_WAIT_S", "600"))
 CHAT_PRIORITY = 10
 EMBED_PRIORITY = 5
@@ -102,7 +110,13 @@ class Gateway:
     def chat(self, body: Dict[str, Any], handler: Any) -> None:
         if not isinstance(body.get("messages"), list) or not body["messages"]:
             raise GatewayError(400, "'messages' must be a non-empty list")
-        entry = self._resolve(body, "chat")
+        try:
+            entry = self._resolve(body, "chat")
+        except GatewayError as exc:
+            if exc.status == 404 and self._frontier_ready():
+                self._chat_frontier(body, handler)
+                return
+            raise
         if entry["runtime"] == "llama_cpp":
             self._chat_llama(entry, body, handler)
         elif entry["runtime"] == "ollama":
@@ -120,7 +134,81 @@ class Gateway:
             raise GatewayError(503, f"model {entry['name']!r} is not ready ({dep.get('state')}): {reason}", "not_ready")
         inf.touch(entry["name"])
         forwarded = dict(body, model=entry["name"])
-        self._proxy(dep["endpoint"], "/v1/chat/completions", forwarded, handler, dep)
+        try:
+            self._proxy(dep["endpoint"], "/v1/chat/completions", forwarded, handler, dep)
+        except GatewayError as exc:
+            if exc.status != 502 or getattr(handler, "_swarm_retried", False):
+                raise
+            # A participant died under the model (a helper vanished, the head
+            # crashed). The deployment was just torn down; place it again on
+            # whoever is still alive and try once more. Slow is fine; broken is not.
+            handler._swarm_retried = True
+            self._chat_llama(entry, body, handler)
+
+    # -- frontier (cloud) lane -------------------------------------------------
+
+    def _frontier_ready(self) -> bool:
+        brain = getattr(self.hub, "brain", None)
+        cfg = getattr(self.hub, "llm_config", None)
+        if brain is None or cfg is None or not cfg.armed:
+            return False
+        return bool(brain.enabled) and not bool(brain.kill_switch)
+
+    def _frontier_budget_ok(self) -> bool:
+        settings = self.hub.holo.settings
+        day = time.strftime("%Y-%m-%d")
+        used = int(settings.get(f"frontier_requests:{day}") or 0)
+        if used >= FRONTIER_DAILY_REQUESTS:
+            return False
+        settings.set(f"frontier_requests:{day}", used + 1)
+        return True
+
+    def _chat_frontier(self, body: Dict[str, Any], handler: Any) -> None:
+        if not self._frontier_budget_ok():
+            raise GatewayError(429, f"cloud lane daily budget ({FRONTIER_DAILY_REQUESTS} requests) used up", "budget")
+        cfg = self.hub.llm_config
+        forwarded = dict(body)
+        forwarded["model"] = body.get("model") if os.environ.get("SWARM_FRONTIER_PASSTHROUGH") == "1" else cfg.model
+        forwarded.pop("chat_template_kwargs", None)
+        forwarded["stream"] = False
+        req = urllib.request.Request(
+            cfg.base_url.rstrip("/") + "/chat/completions",
+            data=json.dumps(forwarded).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer " + cfg.api_key},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=TASK_WAIT_S) as resp:
+                completion = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raise GatewayError(502, f"cloud lane answered {exc.code}") from None
+        except OSError as exc:
+            raise GatewayError(502, f"cloud lane unreachable: {exc}") from None
+        completion["swarm"] = {"path": "frontier", "model": forwarded["model"], "reason": "no local node serves the requested model"}
+        self._log_frontier(str(body.get("model")), completion)
+        if body.get("stream"):
+            self._emit_as_stream(completion, handler)
+            return
+        data = json.dumps(completion).encode("utf-8")
+        handler.send_response(200)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(data)))
+        handler.end_headers()
+        handler.wfile.write(data)
+
+    def _log_frontier(self, requested: str, completion: Dict[str, Any]) -> None:
+        with contextlib.suppress(Exception):
+            reg = self.hub.registry
+            with reg._lock:
+                reg._conn.execute(
+                    "CREATE TABLE IF NOT EXISTS frontier_calls (at REAL, requested TEXT, model TEXT, tokens INTEGER)"
+                )
+                reg._conn.execute(
+                    "INSERT INTO frontier_calls (at, requested, model, tokens) VALUES (?,?,?,?)",
+                    (time.time(), requested, completion.get("model"), (completion.get("usage") or {}).get("total_tokens")),
+                )
+                reg._conn.commit()
+
+    # -- proxy -----------------------------------------------------------------
 
     def _proxy(self, endpoint: str, path: str, body: Dict[str, Any], handler: Any, dep: Dict[str, Any]) -> None:
         parsed = urlparse(endpoint)
@@ -133,6 +221,11 @@ class Gateway:
             self.hub.inference.undeploy(dep["model"], f"head unreachable: {exc}")
             raise GatewayError(502, f"the model's head node did not answer ({exc}); it will be re-placed on the next request") from exc
         stream = bool(body.get("stream"))
+        if resp.status >= 500:
+            detail = resp.read()[:300].decode("utf-8", "replace")
+            conn.close()
+            self.hub.inference.undeploy(dep["model"], f"head returned {resp.status}: {detail}")
+            raise GatewayError(502, f"the model's head failed ({resp.status}); re-placing it")
         handler.send_response(resp.status)
         handler.send_header("Content-Type", resp.getheader("Content-Type") or "application/json")
         handler.send_header("X-Swarm-Head", str(dep.get("head_node_id") or ""))
@@ -142,17 +235,29 @@ class Gateway:
             handler.send_header("Connection", "close")
             handler.end_headers()
             reader = getattr(resp, "read1", None)
+            tail = b""
             while True:
                 chunk = reader(8192) if reader else resp.read(1024)
                 if not chunk:
                     break
                 handler.wfile.write(chunk)
                 handler.wfile.flush()
+                tail = (tail + chunk)[-8192:]
+            with contextlib.suppress(Exception):
+                for line in reversed(tail.decode("utf-8", "replace").splitlines()):
+                    if line.startswith("data: {") and '"timings"' in line:
+                        tps = json.loads(line[6:]).get("timings", {}).get("predicted_per_second")
+                        if tps:
+                            self.hub.inference.record_speed(dep, float(tps))
+                        break
         else:
             data = resp.read()
             try:
                 obj = json.loads(data.decode("utf-8"))
                 if isinstance(obj, dict) and resp.status == 200:
+                    tps = (obj.get("timings") or {}).get("predicted_per_second")
+                    if tps:
+                        self.hub.inference.record_speed(dep, float(tps))
                     obj["swarm"] = {
                         "path": "llama_cpp",
                         "mode": (dep.get("plan") or {}).get("mode"),

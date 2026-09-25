@@ -72,6 +72,23 @@ def with_config(blob: bytes, config: Optional[bytes]) -> bytes:
     return out.getvalue()
 
 
+def signature_ok(offer: dict, headers: Optional[Dict[str, str]]) -> bool:
+    """A hub that knows this node's key signs the bundle hash with it (HMAC
+    over sha256(node key)). An impostor that does not know the key cannot
+    make this node install anything. Open (keyless) hubs send no signature."""
+    key = (headers or {}).get("X-Swarm-Node-Key")
+    sig = offer.get("sig")
+    if not key:
+        return True
+    if not sig:
+        return False
+    import hmac
+
+    key_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    want = hmac.new(key_hash.encode("utf-8"), str(offer.get("sha256")).encode("utf-8"), "sha256").hexdigest()
+    return hmac.compare_digest(want, str(sig))
+
+
 def check_for_update(
     hub_url: str, timeout: float = 10.0, headers: Optional[Dict[str, str]] = None, node_id: str = ""
 ) -> Optional[dict]:
@@ -119,6 +136,8 @@ def apply_update(hub_url: str, headers: Optional[Dict[str, str]] = None, node_id
     remote_sha = offer.get("sha256")
     if not remote_sha:
         return "no-offer"
+    if not signature_ok(offer, headers):
+        return "bad-signature"
     remote_code = offer.get("code_hash")
     mine = own_code_hash()
     if remote_code and mine and remote_code == mine:

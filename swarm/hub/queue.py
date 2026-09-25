@@ -333,6 +333,9 @@ class WorkQueue:
         expires = now + max(lease_seconds, 5.0)
         serves = self._serve_set(node_id, node_device_classes)
         where, params = _class_filter(serves)
+        op_where, op_params = _op_filter(serves)
+        where = where + op_where
+        params = [*params, *op_params]
         try:
             self.conn.execute("BEGIN IMMEDIATE")
             candidates = self.conn.execute(
@@ -408,6 +411,9 @@ class WorkQueue:
             if len(out) >= limit:
                 break
             if not _node_can_serve(bag.get("device_class"), serves):
+                continue
+            ops = [c[3:] for c in serves if c.startswith("op:")]
+            if ops and "*" not in ops and bag.get("op") not in ops:
                 continue
             total = bag["total"]
             if total <= 0:
@@ -521,7 +527,7 @@ class WorkQueue:
                     "SELECT status, leased_to, idem_key, attempts FROM tasks WHERE bag_id=? AND seq=?",
                     (bag_id, seq),
                 ).fetchone()
-                if task is None or task["idem_key"] != idem_key:
+                if task is None or task["idem_key"] != idem_key or task["status"] == "cancelled":
                     dropped += 1
                     continue
                 rkey = new_result_key(payload_json)
@@ -592,6 +598,19 @@ class WorkQueue:
             " VALUES (?,?,?,?,?,?,?)",
             (rkey, idem_key, bag_id, payload_json, node_id, duration_s, now),
         )
+
+    @synchronized
+    def cancel_bag(self, bag_id: str) -> int:
+        """Withdraw a bag: queued and leased tasks stop being handed out; late
+        completions for them are dropped. Returns how many tasks were cancelled."""
+        with self.conn:
+            cur = self.conn.execute(
+                "UPDATE tasks SET status='cancelled', leased_to=NULL WHERE bag_id=? AND status IN ('queued','leased')",
+                (bag_id,),
+            )
+            self.conn.execute("UPDATE bags SET status='cancelled' WHERE bag_id=? AND status='open'", (bag_id,))
+        self.notify_results()
+        return cur.rowcount
 
     @synchronized
     def renew(self, node_id: str, bag_id: str, seqs: List[int], lease_seconds: float) -> int:
@@ -746,6 +765,15 @@ def _class_filter(
         "(%s IS NULL OR %s IN (%s))" % (column, column, placeholders),
         [str(c) for c in serves],
     )
+
+
+def _op_filter(serves: Sequence[str]) -> Tuple[str, List[str]]:
+    """Only ops the node said it can run. `op:*` (or no op classes at all —
+    agents older than op routing) means every op, adapters included."""
+    ops = [c[3:] for c in serves if c.startswith("op:")]
+    if not ops or "*" in ops:
+        return ("", [])
+    return (" AND b.op IN (%s)" % ",".join("?" * len(ops)), ops)
 
 
 def _node_can_serve(required: Optional[str], serves: Sequence[str]) -> bool:

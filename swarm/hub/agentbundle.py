@@ -15,7 +15,10 @@ import zipfile
 from pathlib import Path
 from typing import List, Optional, Union
 
-_BUNDLE_PACKAGES = ["core", "probe", "bench", "transport", "agent"]
+# Holographic: the agent file carries the WHOLE swarm, hub included, so any
+# node can become the hub (hub/holo.py). Everything here is stdlib-only.
+_BUNDLE_PACKAGES = ["core", "probe", "bench", "transport", "agent", "hub", "integrator"]
+_BUNDLE_MODULES = ["cli.py", "mcp.py"]
 
 _MAIN = '''"""swarm-agent pyz entrypoint."""
 import sys
@@ -45,6 +48,9 @@ def build_agent_pyz(output: Union[str, Path, None] = None, source_root: Optional
     init_file = pkg_root / "__init__.py"
     if init_file.exists():
         sources.append(("swarm/__init__.py", init_file.read_bytes()))
+    for module in _BUNDLE_MODULES:
+        if (pkg_root / module).is_file():
+            sources.append(("swarm/" + module, (pkg_root / module).read_bytes()))
     for pkg in _BUNDLE_PACKAGES:
         pkg_dir = pkg_root / pkg
         if not pkg_dir.is_dir():
