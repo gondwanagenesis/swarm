@@ -3,6 +3,8 @@ results back in input order; a raising item is reported, not hidden."""
 
 import json
 
+import pytest
+
 from swarm import cli
 from swarm.agent.daemon import Agent
 from swarm.hub.server import Hub
@@ -16,6 +18,7 @@ def run(params):
 '''
 
 
+@pytest.mark.slow
 def test_map_round_trip(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(runtimes_mod, "find_llama_binaries", lambda: {})
     monkeypatch.setenv("SWARM_OLLAMA_URL", "http://127.0.0.1:9")

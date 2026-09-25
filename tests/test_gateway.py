@@ -136,6 +136,7 @@ def _free_port():
     return port
 
 
+@pytest.mark.slow
 def test_pooled_model_end_to_end(monkeypatch, tmp_path):
     (tmp_path / "tiny.gguf").write_bytes(b"GGUF")
     monkeypatch.setenv("SWARM_MODELS_DIR", str(tmp_path))

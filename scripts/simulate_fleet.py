@@ -48,7 +48,9 @@ sys.path.insert(0, str(ROOT))
 
 FLEET = [
     # name, emulated profile, options
-    ("thin-laptop", "thin-laptop", {"holds_models": True, "ollama": True}),
+    # an old laptop on a shelf: it holds the models and serves them (dedicated;
+    # a laptop someone is USING would rest, which is the welfare rule, not a bug)
+    ("thin-laptop", "thin-laptop", {"holds_models": True, "ollama": True, "dedicated": True}),
     ("gpu-box", "gpu-box", {}),
     ("phone-1", "phone", {"code_worker": True}),
     ("phone-2", "phone", {"code_worker": True}),
@@ -191,6 +193,8 @@ class Sim:
                "--hub-port", str(port), "--log", str(home / "agent.log")]
         if opts.get("code_worker"):
             cmd.append("--code-worker")
+        if opts.get("dedicated"):
+            cmd.append("--dedicated")
         proc = subprocess.Popen(
             cmd, cwd=str(ROOT), env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             **({"start_new_session": True} if os.name != "nt" else {}),
@@ -279,9 +283,9 @@ class Sim:
         except Exception as exc:
             self.record("S5", "AI code runs only on code workers", "FAIL", str(exc), time.time() - t0)
             return
-        node = "sim-" + out.get("node", "")
+        node = out.get("node", "")  # first 8 chars of the node id that ran it
         worker_ids = [a["node_id"] for a in self.agents.values() if a["opts"].get("code_worker")]
-        ok = out.get("result") == 332833500 and any(w.startswith(node) for w in worker_ids)
+        ok = out.get("result") == 332833500 and bool(node) and any(w.startswith(node) for w in worker_ids)
         self.record("S5", "AI code (MCP swarm_run_python) runs only on code workers", "PASS" if ok else "FAIL",
                     f"result={out.get('result')} on {node}* (code workers: phones)", time.time() - t0)
 
@@ -412,7 +416,7 @@ class Sim:
             "|---|---|---|",
         ]
         for name, kind, opts in FLEET:
-            role = ", ".join(k for k in ("holds_models", "code_worker", "hot") if opts.get(k)) or "worker"
+            role = ", ".join(k for k in ("holds_models", "dedicated", "code_worker", "hot") if opts.get(k)) or "worker"
             lines.append(f"| {name} | {kind} | {role} |")
         lines += ["", "| # | Scenario | Result | Time | Evidence |", "|---|---|---|---|---|"]
         for r in self.results:

@@ -99,7 +99,13 @@ class HoloState:
 
     @property
     def replica_path(self) -> Path:
-        return self.dir / "replica" / f"{self.data.get('swarm_id') or 'swarm'}.db.gz"
+        return self.dir / "replica" / f"{self.node_id[:12]}-{self.data.get('swarm_id') or 'swarm'}.db.gz"
+
+    @property
+    def hub_db(self) -> Path:
+        """Where THIS node's promoted hub keeps its memory. Per node, so two
+        agents on one machine (simulations, tests) never share a database."""
+        return self.dir / f"hub-{self.node_id[:12]}" / "hub.db"
 
 
 def fetch_replica(state: HoloState, hub_url: str, headers: Dict[str, str]) -> bool:
@@ -168,7 +174,7 @@ def promote(state: HoloState, entry: Dict[str, Any]) -> Optional[subprocess.Pope
     from ..hub.holo import restore_replica
 
     new_epoch = state.epoch + 1
-    db = state.dir / "hub" / "hub.db"
+    db = state.hub_db
     restore_replica(replica.read_bytes(), db, new_epoch)
     with contextlib.suppress(Exception):
         import sqlite3
@@ -190,7 +196,7 @@ def promote(state: HoloState, entry: Dict[str, Any]) -> Optional[subprocess.Pope
 def launch_hub(state: HoloState, entry: Dict[str, Any], epoch: int) -> Optional[subprocess.Popen]:
     """Start (or restart) the hub process on this node's hub database.
     Detached: the hub belongs to the swarm and outlives this agent."""
-    db = state.dir / "hub" / "hub.db"
+    db = state.hub_db
     if not db.exists():
         return None
     parsed = urlparse(entry["url"])
@@ -204,7 +210,7 @@ def launch_hub(state: HoloState, entry: Dict[str, Any], epoch: int) -> Optional[
     cmd += ["--host", host, "--port", str(port), "--db", str(db), "--epoch", str(epoch)]
     if os.environ.get("SWARM_HUB_SECURE") == "1":
         cmd.append("--secure")
-    log = open(state.dir / "hub-promoted.log", "ab")  # noqa: SIM115 - handed to the child
+    log = open(state.hub_db.parent / "hub-promoted.log", "ab")  # noqa: SIM115 - handed to the child
     kwargs: Dict[str, Any] = {"stdin": subprocess.DEVNULL, "stdout": log, "stderr": subprocess.STDOUT}
     if os.name == "nt":
         kwargs["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | NEW_PROCESS_GROUP

@@ -36,3 +36,8 @@ ignore = ["E501", "RUF059"]
 "swarm/agent/**" = []
 "swarm/transport/**" = []
 "tests/**" = ["E402"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: end-to-end tests that start real hub/agent processes (run in CI; skipped inside workshop sandboxes)",
+]

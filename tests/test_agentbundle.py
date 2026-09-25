@@ -3,6 +3,8 @@ import sys
 import zipfile
 from io import BytesIO
 
+import pytest
+
 from swarm.hub.agentbundle import build_agent_pyz
 
 
@@ -35,6 +37,7 @@ def test_pyz_runs_help(tmp_path):
     assert "--hub" in proc.stdout
 
 
+@pytest.mark.slow
 def test_the_agent_file_can_run_a_hub(tmp_path):
     """Any node can become the hub: the agent file itself serves one."""
     import json

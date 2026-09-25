@@ -1,6 +1,6 @@
 # Swarm
 
-> Next builder: **`HANDOFF.md`** — the full map, the laws, the footguns.
+> **Using it?** Read **[`HOWTO.md`](HOWTO.md)** — the manual. **Building it?** **`HANDOFF.md`** — the full map, the laws, the footguns.
 
 **A spreading cloud of compute. A superorganism, not a scheduler.**
 
@@ -67,7 +67,10 @@ stated. Nothing here is marked proven because it looked right.
 | Real workloads | **Proven** | `embed` and `chat` run on the node's own runtime (Ollama), routed by `model:<name>` to the node that actually holds the model. Fail closed with no runtime. |
 | The front door (`/v1`) | **Proven live** | OpenAI-compatible chat/embeddings/models on the hub; any tool with a base-URL setting uses the fleet. Answered live through a VPS hub from a laptop GPU. |
 | The teeth (M5) | **Proven live** | Models run on one node when they fit (never sharded then), pooled over several via llama.cpp RPC — split from measured free memory — when they do not. Live: Qwen3.5-4B split laptop GPU + VPS CPU across the internet at 1.6–2.0 tok/s (324 ms link; the same model alone on the laptop: 5.4–7). Pooling buys capacity, not speed — numbers in `REQUIREMENTS.md`. |
-| General compute (`swarm map`) | **Proven (tests)** | Your Python function over a list, across every node, results in order; failures retried, then reported. |
+| Holographic hub | **Proven** | Every agent file carries the whole swarm; successors hold replicas; kill the hub and a device becomes the hub at a higher epoch, the fleet follows, the owner key keeps working (tests + simulation S9: 14 s). |
+| Every kind of device | **Proven: Windows, Linux, browsers** | Real one-line installers ran on Windows and Linux (autostart, crash restart, clean uninstall); a browser tab joins with one tap. Mac/Android/Pi paths written and emulated, not yet run on those devices. |
+| Brain → fleet tools (MCP) | **Proven** | `python -m swarm.mcp`: an AI can run code on the fleet — only on nodes that opted in as code workers. |
+| General compute (`swarm map`) | **Proven live** | Your Python function over a list, across every node, results in order; failures retried, then reported. Live: 40/40 across a Linux and a Windows machine; 80/80 with two devices killed mid-batch (simulation S3). |
 | Accelerated compute (GPU tier) | **Proven via Vulkan** | llama.cpp's Vulkan backend on the laptop's Iris Xe (live). The `matmul` torch-CUDA tier is still unexecuted — no CUDA box yet. |
 | Adapter synthesis (M4 Tier 1) | **Built, unproven here** | Loop, budget cap, and promotion-only-after-gate are wired and tested against scripted LLMs. No run against a live model has been recorded. |
 | Collective motion (M6) | **Not started** | Multi-model packing, adaptive replication. |

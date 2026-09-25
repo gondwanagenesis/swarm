@@ -55,6 +55,7 @@ def test_mcp_handshake_and_tool_list(quiet_runtimes):
         hub.stop()
 
 
+@pytest.mark.slow
 def test_ai_code_runs_only_on_opted_in_code_workers(quiet_runtimes):
     hub = Hub(host="127.0.0.1", port=0)
     _, port = hub.start_background()
@@ -240,3 +241,30 @@ def test_bag_priority_is_capped_below_interactive_chat():
         assert canonical_hash({"x": 1})
     finally:
         hub.registry.close()
+
+
+def test_the_split_strategy_is_learned_from_measured_speed(tmp_path):
+    """Accelerator-first is only a prior: after it is measured, home-first
+    gets one trial, and from then on the faster measured strategy wins."""
+    hub = Hub(host="127.0.0.1", port=0)
+    _, port = hub.start_background()
+    try:
+        inf = hub.inference
+        head_inf = {"runtimes": ["llama_server", "llama_rpc"], "llama": {"llama_server": "x", "llama_rpc": "x", "devices": []},
+                    "models": [{"name": "m", "kind": "chat", "runtime": "llama_cpp", "size_bytes": 5 * GIB, "n_layers": 32}]}
+        gpu_inf = {"runtimes": ["llama_rpc", "llama_server"], "models": [],
+                   "llama": {"llama_rpc": "x", "llama_server": "x", "devices": [{"id": "Vulkan0", "free_bytes": 12 * GIB}]}}
+        for nid, data, ram in (("head", head_inf, 5 * GIB), ("gpu", gpu_inf, 4 * GIB)):
+            hub.handle_register({"profile": {"node_id": nid, "hostname": nid, "os": "linux", "arch": "x86_64",
+                                             "memory": {"free_bytes": ram}}, "capability": {}, "benchmarks": [],
+                                 "inference": data, "dedicated": True}, client_host="127.0.0.1")
+        first = inf.plan("m")
+        assert first["mode"] == "pooled" and first["strategy"] == "accel_first" and "prior" in first["reason"]
+        inf.record_speed({"model": "m", "head_node_id": "head", "plan": first}, 2.7)
+        trial = inf.plan("m")
+        assert trial["strategy"] == "home_first" and "one measured trial" in trial["reason"]
+        inf.record_speed({"model": "m", "head_node_id": "head", "plan": trial}, 5.4)
+        settled = inf.plan("m")
+        assert settled["strategy"] == "home_first" and "5.4" in settled["reason"]
+    finally:
+        hub.stop()

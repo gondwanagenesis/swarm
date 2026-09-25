@@ -198,6 +198,7 @@ def plan_llama(
     helpers: List[Dict[str, Any]],
     force_shard: bool = False,
     ctx: int = DEFAULT_CTX,
+    strategy: str = "accel_first",
 ) -> Dict[str, Any]:
     """Place a GGUF model. Returns a plan dict with ``feasible`` and a
     ``reason`` either way. Inputs are measured-only node views::
@@ -252,6 +253,7 @@ def plan_llama(
             "devices": [d["id"] for d in head_devs] if head_kind == "gpu" else [],
         },
         "force_shard": bool(force_shard),
+        "strategy": strategy,
     }
 
     if not force_shard and head_cap >= need:
@@ -321,17 +323,27 @@ def plan_llama(
             ),
         )
 
-    # Bytes per participant: fewest-nodes fill (head first, then largest
-    # helpers) — or, when forced, proportional to capacity across all.
+    # Bytes per participant. WHO participates was decided above (fewest
+    # nodes: every extra node is another hop per token). HOW MUCH each holds
+    # is a speed question, and with no per-device measurement yet the prior
+    # is: accelerators llama.cpp reports (Vulkan/CUDA/Metal) compute layers
+    # faster than CPUs, so they fill first, up to their measured free memory.
+    # Forced splits stay proportional to capacity across everyone.
     caps = [head_cap] + [p["cap"] for p in chosen]
+    kinds = [head_kind] + [p["kind"] for p in chosen]
     if force_shard:
         shares = [c / total_cap * need for c in caps]
     else:
-        shares = []
+        shares = [0.0] * len(caps)
         remaining = need
-        for c in caps:
-            take = min(c, remaining)
-            shares.append(take)
+        if strategy == "home_first":
+            # keep layers where the file already is; accelerators next
+            order = sorted(range(len(caps)), key=lambda i: (i == 0, kinds[i] == "gpu"), reverse=True)
+        else:
+            order = sorted(range(len(caps)), key=lambda i: (kinds[i] == "gpu", i == 0), reverse=True)
+        for i in order:
+            take = min(caps[i], remaining)
+            shares[i] = take
             remaining -= take
     layers = _largest_remainder(shares, n_layers) if n_layers else [0] * len(shares)
     if n_layers:
@@ -370,7 +382,14 @@ def plan_llama(
                 "kind": p["kind"],
             }
         )
-    how = "spread over every helper (force_shard)" if force_shard else "fewest nodes that fit, largest first"
+    how = (
+        "spread over every helper (force_shard)"
+        if force_shard
+        else (
+            "fewest nodes that fit, largest first; "
+            + ("the home node keeps layers first" if strategy == "home_first" else "accelerators hold layers first")
+        )
+    )
     return dict(
         base,
         feasible=True,
@@ -627,7 +646,10 @@ class Inference:
     def record_speed(self, dep: Dict[str, Any], tps: float) -> None:
         model = dep.get("model")
         head = dep.get("head_node_id")
-        mode = (dep.get("plan") or {}).get("mode") or "single"
+        plan = dep.get("plan") or {}
+        mode = plan.get("mode") or "single"
+        if mode == "pooled" and not plan.get("force_shard"):
+            mode = f"pooled:{plan.get('strategy') or 'accel_first'}"
         if not model or not head or tps <= 0:
             return
         row = self.conn.execute(
@@ -668,6 +690,23 @@ class Inference:
         ]
         helpers = [self._node_view(n) for n in nodes if "llama_rpc" in (n["data"].get("llama") or {})]
         plan = plan_llama(entry, heads, helpers, force_shard=force_shard, ctx=ctx)
+        if plan.get("feasible") and plan.get("mode") == "pooled" and not force_shard:
+            # How to divide layers between the chosen nodes is learned, not
+            # assumed: the accelerator-first prior runs first, the home-first
+            # alternative gets one measured trial, then the faster one wins.
+            head_id = plan["head"]["node_id"]
+            accel = self.speed(entry["name"], head_id, "pooled:accel_first")
+            home = self.speed(entry["name"], head_id, "pooled:home_first")
+            if accel is None:
+                choice, why = "accel_first", "prior (nothing measured yet)"
+            elif home is None:
+                choice, why = "home_first", f"one measured trial (accelerator-first ran {accel:.1f} tok/s)"
+            else:
+                choice = "home_first" if home > accel else "accel_first"
+                why = f"measured: accelerator-first {accel:.1f} vs home-first {home:.1f} tok/s"
+            if choice != plan.get("strategy"):
+                plan = plan_llama(entry, heads, helpers, force_shard=False, ctx=ctx, strategy=choice)
+            plan["reason"] = plan["reason"] + f"; split strategy {choice}: {why}"
         plan["model"] = entry["name"]
         return plan
 

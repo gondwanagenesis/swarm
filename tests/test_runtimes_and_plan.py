@@ -174,3 +174,12 @@ def test_helpers_on_a_different_llama_build_never_pool():
     assert "other (build 11190)" in plan["reason"]
     only_other = plan_llama(MODEL, [head], [other], force_shard=True)
     assert not only_other["feasible"] and "update llama.cpp" in only_other["reason"]
+
+
+def test_a_gpu_helper_holds_the_layers_a_cpu_head_cannot_speed_through():
+    head = dict(_node("thin-laptop", ram_free=4 * GIB), dedicated=True)
+    gpu = _node("gpu-box", gpu_free=11 * GIB)
+    plan = plan_llama(MODEL, [head], [gpu])
+    by_id = {p["node_id"]: p for p in plan["participants"]}
+    assert plan["mode"] == "pooled" and by_id["gpu-box"]["layers"] > by_id["thin-laptop"]["layers"]
+    assert "accelerators hold layers first" in plan["reason"]

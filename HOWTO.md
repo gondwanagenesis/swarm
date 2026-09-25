@@ -1,4 +1,4 @@
-# HOWTO — The Swarm
+# The Swarm — Manual
 
 **Turn every device you own into one computer.** Old phones, a gaming PC, a
 laptop, a Raspberry Pi, a VPS, even an iPad in a browser tab: each becomes a
@@ -6,8 +6,22 @@ node. You get one address that any AI tool can use, one command to run your
 code everywhere, and a swarm that keeps working when devices die — including
 the coordinator itself.
 
-This guide has three parts: **set it up** (10 minutes), **use it**, and
-**how it works** (the mental model, for when you want to know why).
+This manual has three parts: **set it up** (10 minutes), **use it**, and
+**how it works** (the mental model, for when you want to know why). It ends
+with everyday operations, troubleshooting, the honest limits, and a
+reference.
+
+## At a glance — what you do, and what happens
+
+| You do | The swarm does |
+|---|---|
+| Start a hub once on an always-on machine | Mints your owner key; serves the dashboard, the join page, and the AI address |
+| Paste one line on a device (or double-click `JOIN`, or tap **Start** in a browser) | Installs the agent + Python + llama.cpp as needed, starts on boot, self-updates, measures the machine, joins |
+| Point an AI app at `http://<hub>:8777/v1` | Finds the device that holds the model; starts it there (split over several only if it fits nowhere); unloads it when idle |
+| `swarm map fn.py inputs.jsonl` | Runs your function on every idle device; redoes work from devices that die; returns results in order |
+| Let Claude/OpenCode/Thea use the MCP tools | Runs their code only on devices you marked as code workers |
+| Nothing | Keeps a copy of the hub's memory on successor devices; if the hub dies, one becomes the hub and everyone follows |
+| Keep using your devices normally | Yields CPU, backs off when you type, when the battery is low, or when a device runs hot |
 
 ---
 

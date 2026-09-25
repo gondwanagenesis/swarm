@@ -183,7 +183,10 @@ if path.endswith(".zip"):
     zipfile.ZipFile(path).extractall(target)
 else:
     with tarfile.open(path) as tf:
-        tf.extractall(target)
+        try:
+            tf.extractall(target, filter="data")  # refuses absolute paths, .., devices
+        except TypeError:  # Python < 3.12 has no filter argument
+            tf.extractall(target)
 os.remove(path)
 entries = os.listdir(target)
 if len(entries) == 1 and os.path.isdir(os.path.join(target, entries[0])):
@@ -196,6 +199,17 @@ for root, _, files in os.walk(dest):
         if f in ("rpc-server", "llama-server", "ggml-rpc-server") or f.endswith(".so") or ".so." in f:
             fp = os.path.join(root, f)
             os.chmod(fp, os.stat(fp).st_mode | 0o755)
+# a prebuilt that cannot start here (musl vs glibc, missing libraries) is
+# worse than none: remove it and say so
+import shutil, subprocess
+server = os.path.join(target, "llama-server")
+try:
+    ok = subprocess.run([server, "--version"], capture_output=True, timeout=60).returncode == 0
+except Exception:
+    ok = False
+if not ok:
+    shutil.rmtree(target, ignore_errors=True)
+    sys.exit("llama.cpp: the prebuilt build does not run on this system; skipped (the agent still works)")
 print("llama.cpp: installed into " + target)
 PYEOF
   fi
@@ -221,7 +235,7 @@ nohup sh -c 'while true; do "$PY" "$AGENT" $ARGS; sleep 10; done' >/dev/null 2>&
 EOF
     chmod +x "$HOME/.termux/boot/swarm-agent"
     echo "autostart: Termux:Boot script installed (install the Termux:Boot app once, open it once)"
-    UNINSTALL="rm -f ~/.termux/boot/swarm-agent; pkill -f '[s]warm-agent.pyz'; rm -rf ~/.swarm/swarm-agent.pyz ~/.swarm/node_keys.json ~/.swarm/agent.log* ~/.swarm/llama ~/.swarm/logs"
+    UNINSTALL="rm -f ~/.termux/boot/swarm-agent; pkill -f '[s]warm-agent.pyz'; rm -rf ~/.swarm/swarm-agent.pyz ~/.swarm/node_keys.json ~/.swarm/agent.log* ~/.swarm/agent*.lock ~/.swarm/node_id ~/.swarm/holo-*.json ~/.swarm/replica ~/.swarm/hub-* ~/.swarm/hub-promoted.log ~/.swarm/llama ~/.swarm/logs"
   elif [ "$(uname)" = "Darwin" ]; then
     PLIST="$HOME/Library/LaunchAgents/net.swarm.agent.plist"
     mkdir -p "$HOME/Library/LaunchAgents"
@@ -239,7 +253,7 @@ EOF
     launchctl unload "$PLIST" 2>/dev/null || true
     launchctl load "$PLIST" && STARTED=1
     echo "autostart: LaunchAgent installed"
-    UNINSTALL="launchctl unload $PLIST; rm -f $PLIST; rm -rf ~/.swarm/swarm-agent.pyz ~/.swarm/node_keys.json ~/.swarm/agent.log* ~/.swarm/llama ~/.swarm/logs"
+    UNINSTALL="launchctl unload $PLIST; rm -f $PLIST; rm -rf ~/.swarm/swarm-agent.pyz ~/.swarm/node_keys.json ~/.swarm/agent.log* ~/.swarm/agent*.lock ~/.swarm/node_id ~/.swarm/holo-*.json ~/.swarm/replica ~/.swarm/hub-* ~/.swarm/hub-promoted.log ~/.swarm/llama ~/.swarm/logs"
   elif command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
     UNIT_DIR="$HOME/.config/systemd/user"
     mkdir -p "$UNIT_DIR"
@@ -261,14 +275,14 @@ EOF
     systemctl --user enable --now swarm-agent.service && STARTED=1
     echo "autostart: systemd --user unit installed"
     echo "  (to keep it running while you are logged out: sudo loginctl enable-linger $USER)"
-    UNINSTALL="systemctl --user disable --now swarm-agent; rm -f $UNIT_DIR/swarm-agent.service; rm -rf ~/.swarm/swarm-agent.pyz ~/.swarm/node_keys.json ~/.swarm/agent.log* ~/.swarm/llama ~/.swarm/logs"
+    UNINSTALL="systemctl --user disable --now swarm-agent; rm -f $UNIT_DIR/swarm-agent.service; rm -rf ~/.swarm/swarm-agent.pyz ~/.swarm/node_keys.json ~/.swarm/agent.log* ~/.swarm/agent*.lock ~/.swarm/node_id ~/.swarm/holo-*.json ~/.swarm/replica ~/.swarm/hub-* ~/.swarm/hub-promoted.log ~/.swarm/llama ~/.swarm/logs"
   elif command -v crontab >/dev/null 2>&1; then
     ( crontab -l 2>/dev/null | grep -v swarm-agent.pyz; echo "@reboot sh -c 'while true; do $PY $AGENT $ARGS; sleep 10; done'" ) | crontab -
     echo "autostart: crontab @reboot entry installed"
-    UNINSTALL="crontab -l | grep -v swarm-agent.pyz | crontab -; pkill -f '[s]warm-agent.pyz'; rm -rf ~/.swarm/swarm-agent.pyz ~/.swarm/node_keys.json ~/.swarm/agent.log* ~/.swarm/llama ~/.swarm/logs"
+    UNINSTALL="crontab -l | grep -v swarm-agent.pyz | crontab -; pkill -f '[s]warm-agent.pyz'; rm -rf ~/.swarm/swarm-agent.pyz ~/.swarm/node_keys.json ~/.swarm/agent.log* ~/.swarm/agent*.lock ~/.swarm/node_id ~/.swarm/holo-*.json ~/.swarm/replica ~/.swarm/hub-* ~/.swarm/hub-promoted.log ~/.swarm/llama ~/.swarm/logs"
   fi
 fi
-[ -z "$UNINSTALL" ] && UNINSTALL="pkill -f '[s]warm-agent.pyz'; rm -rf ~/.swarm/swarm-agent.pyz ~/.swarm/node_keys.json ~/.swarm/agent.log* ~/.swarm/llama ~/.swarm/logs"
+[ -z "$UNINSTALL" ] && UNINSTALL="pkill -f '[s]warm-agent.pyz'; rm -rf ~/.swarm/swarm-agent.pyz ~/.swarm/node_keys.json ~/.swarm/agent.log* ~/.swarm/agent*.lock ~/.swarm/node_id ~/.swarm/holo-*.json ~/.swarm/replica ~/.swarm/hub-* ~/.swarm/hub-promoted.log ~/.swarm/llama ~/.swarm/logs"
 
 if [ "$STARTED" != 1 ]; then
   if [ "$IS_TERMUX" = 1 ]; then termux-wake-lock 2>/dev/null || true; fi
@@ -388,7 +402,7 @@ $cmd = """$pyw"" ""$Agent"" $AgentArgs"
 $vbsLines = @(
     'Set sh = CreateObject("WScript.Shell")',
     'Do',
-    '    sh.Run "' + $cmd.Replace('"', '""') + '", 0, True',
+    ('    sh.Run "' + $cmd.Replace('"', '""') + '", 0, True'),  # parens: in @(), ',' binds tighter than '+'
     '    WScript.Sleep 10000',
     'Loop'
 )
@@ -401,7 +415,7 @@ if ($Autostart -ne '0') {
 Start-Process -FilePath 'wscript.exe' -ArgumentList """$Vbs"""
 Write-Host ''
 Write-Host "joined: this PC is now a swarm node (log: $Log)"
-Write-Host "to leave the swarm: Remove-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run SwarmAgent; Get-CimInstance Win32_Process | ? CommandLine -like '*swarm-agent.*' | % { Stop-Process -Id `$_.ProcessId }; Remove-Item -Recurse -Force `"$Dir\swarm-agent.*`", `"$Dir\node_keys.json`", `"$Dir\agent.log*`""
+Write-Host "to leave the swarm: Remove-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run SwarmAgent; Get-CimInstance Win32_Process | ? CommandLine -like '*swarm-agent.*' | % { Stop-Process -Id `$_.ProcessId }; Remove-Item -Recurse -Force `"$Dir\swarm-agent.*`", `"$Dir\node_keys.json`", `"$Dir\agent.log*`", `"$Dir\agent*.lock`", `"$Dir\node_id`", `"$Dir\holo-*.json`", `"$Dir\replica`", `"$Dir\hub-*`", `"$Dir\llama`", `"$Dir\logs`" -ErrorAction SilentlyContinue"
 '''
 
 WINDOWS_CMD_TEMPLATE = r'''@echo off

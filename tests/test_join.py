@@ -98,3 +98,20 @@ def test_powershell_joiner_parses(tmp_path):
         f"'{script}',[ref]$t,[ref]$e)|Out-Null; exit $e.Count"
     )
     assert subprocess.run(["powershell", "-NoProfile", "-Command", check]).returncode == 0
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="runs the generated VBS launcher logic in PowerShell")
+def test_windows_launcher_is_one_command_line(tmp_path):
+    """Regression: in a PowerShell @() list, ',' binds tighter than '+', which
+    once split the VBS Run command over three lines (the agent never started)."""
+    script = render_powershell("http://hub:8777", "swk_t")
+    start = script.index("$cmd = ")
+    end = script.index("Set-Content -Path $Vbs")
+    snippet = (
+        "$pyw='C:\\py\\pythonw.exe'; $Agent='C:\\a\\swarm-agent.pyz'; $AgentArgs='--work';"
+        + script[start:end]
+        + "$vbsLines.Count; $vbsLines[2]"
+    )
+    out = subprocess.run(["powershell", "-NoProfile", "-Command", snippet], capture_output=True, text=True).stdout.splitlines()
+    assert out[0].strip() == "5", out
+    assert out[1].strip().startswith('sh.Run ""') and out[1].strip().endswith("0, True")

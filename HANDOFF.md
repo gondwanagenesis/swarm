@@ -191,6 +191,47 @@ Live topology (Diego's fleet):
   `SWARM_OWNER_KEY=$(cat …)`; never print it).
 - **Fleet llama.cpp tag:** pinned in the hub db (`hub_settings.llama_tag`).
 
+## The completion pass (2026-09-26, later) — holographic, every device, simulated
+
+New organs:
+
+| Organ | Module | Job |
+|---|---|---|
+| Holographic hub | `hub/holo.py`, `agent/holo.py` | swarm_id + epoch; ranked successors in every heartbeat; replicas (owner key as hash only); promotion at epoch+1; old/duplicate hubs step aside (409 `moved_to`), fast peer checks at 3/10/30 s |
+| MCP tools | `swarm/mcp.py` | brains call status/models/chat/embed/run_python/map; AI code only on `--code-worker` nodes |
+| Browser nodes | `hub/browser_worker.py` | `/worker` page: Web Worker ops byte-identical to Python; op routing (`op:*` classes) |
+| Cloud lane | `hub/gateway.py` | owner-armed fallback for models no device serves; daily cap; kill switch |
+| Learning placement | `hub/inference.py` | head chosen by measured tokens/s; split strategy (accelerator-first vs home-first) learned by one trial |
+| Simulator | `scripts/simulate_fleet.py` | 8 emulated devices as real processes, 9 chaos scenarios → `docs/SIMULATION.md` |
+
+The whole `swarm` package is now stdlib-only (CI gates `swarm/`), because
+every agent file carries the hub.
+
+### Footguns found in the completion pass
+
+19. **PowerShell `@(...)`: `,` binds tighter than `+`.** `@('a', 'b' + $x + 'c')`
+    is FOUR items. It split the Windows launcher command and the agent never
+    started. Parenthesise concatenations inside array literals.
+20. **Two successors can both promote** when the first starts slower than the
+    rank grace (seen on macOS CI). Same-epoch ties go to the better rank;
+    promoted hubs peer-check at 3/10/30 s; the loser retires its own hub.
+21. **Emulated devices read the HOST's battery** unless emulation overrides it
+    (`SWARM_EMULATE_BATTERY`) — a laptop at 19% parked the whole emulated fleet.
+22. **A personal laptop in use serves nothing** (welfare). If the only holder of
+    a model is such a laptop, requests for that model wait. Make model homes
+    dedicated machines.
+23. **Git Bash rewrites `/tmp/...`** in arguments to Windows paths; use
+    `MSYS_NO_PATHCONV=1` when passing Linux paths to `wsl`.
+24. **A binary that exists is not a binary that runs** (glibc build on musl).
+    Discovery now runs `--version` / `--help` before offering llama.cpp; joiners
+    delete a prebuilt that cannot start.
+25. **Docker Desktop on this laptop cannot start**: every AF_UNIX socket file it
+    creates becomes undeletable (Error 1920). Renaming the containing folder
+    clears one start; a reboot is the real fix. `scripts/docker_fleet.py` is
+    ready for a machine where Docker works.
+26. **`tarfile.extractall` without `filter="data"`** accepts `..` and absolute
+    paths from a hostile archive. The joiner uses the filter where available.
+
 ## Hard-hat areas (rough drafts — honest labels)
 
 - `swarm/hub/pipeline.py` — M5 *scaffold*. Stage→node mapping on measured free

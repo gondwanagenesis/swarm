@@ -41,7 +41,7 @@ as the work it describes.
 |---|---|---|---|
 | H1 | Work survives any node dying mid-job (leases expire, work regrows elsewhere, exactly-once results) | ✅ | Pre-existing: `demo_m2.py` kill-node, 400/400 exactly once |
 | H2 | Failed work is retried elsewhere, then reported — never silently "done" | ✅ | `tests/test_queue_failures.py` |
-| H3 | Crashed agent comes back by itself on every platform | 🟡 | systemd `Restart=always`, LaunchAgent `KeepAlive`; watchdog loops for Windows (VBS), Termux, cron, plain start. Not yet crash-tested live |
+| H3 | Crashed agent comes back by itself on every platform | ✅ Windows, Linux · 🟡 others | Live: killed the Windows agent → the VBS watchdog restarted it in ~10 s; killed the Linux agent → systemd restarted it (PID 333 → 438). Found + fixed on the way: a PowerShell precedence bug had split the VBS command and the Windows agent never started |
 | H4 | A restart can never double a node | ✅ | Single-instance lock (`tests/test_invisible.py`) |
 | H5 | A model deployment whose participant dies is failed and re-placed on the next request | 🟡 | `tick()` logic + tests; not killed live |
 | H6 | Every node carries the WHOLE swarm (hub code too — it is stdlib) | ✅ | Agent file ships hub + integrator + CLI + MCP; CI gates the whole package stdlib-only; `tests/test_agentbundle.py` runs a hub FROM the agent file |
@@ -56,8 +56,8 @@ as the work it describes.
 |---|---|---|---|
 | J1 | Unit + integration suite across Windows/macOS/Linux × Python 3.9/3.12 | ✅ | GitHub Actions matrix; stdlib gate covers the whole package |
 | J2 | Emulated devices: phone, old phone, Pi, GPU box, laptop, thin laptop, server — every emulated node says so | ✅ | `--emulate`; declared numbers flagged as an anomaly and `emulated` on registration |
-| J3 | Whole-fleet simulation with chaos (devices die, a pooled helper dies, the hub dies) | see `docs/SIMULATION.md` | `scripts/simulate_fleet.py`: real processes, secure hub, real llama.cpp |
-| J4 | Real joiners on emulated Linux / Android devices | see run log | Docker (Linux) and termux-docker (Android) containers running the real one-line joiner |
+| J3 | Whole-fleet simulation with chaos (devices die, a pooled helper dies, the hub dies) | ✅ | `docs/SIMULATION.md`: 9/9 scenarios pass |
+| J4 | Real joiners on other operating systems, and a cross-OS job | ✅ Linux + Windows · 🟡 Android container | WSL-Linux hub + WSL-Linux device (real `curl \| sh`) + Windows device: a 40-item batch split Linux 29 / Windows 11, 40/40 ok. Container runs (Linux ×2, Alpine without Python, Termux) are scripted in `scripts/docker_fleet.py` for a machine with working Docker |
 
 ## I. Invisible & harmless (priorities 2 and 3)
 
@@ -76,12 +76,12 @@ as the work it describes.
 
 | # | Requirement | Status | Evidence / gap |
 |---|---|---|---|
-| A1 | One owner action joins a device: one pasted line or one double-click | ✅ Linux · 🟡 Windows, macOS, Android, Pi | VPS joined with `curl …/join.sh \| sh` (live). Windows joiner parses and its llama step ran by hand on the laptop; the full script has not been run end-to-end on a fresh PC |
-| A2 | Joiner installs its own prerequisites, after saying what it will install | ✅ llama.cpp on Linux · 🟡 Python via winget / pkg | VPS: fetched the pinned llama.cpp release unasked-for-anything-else. Python auto-install only where it needs no password (winget per-user, Termux pkg, passwordless apt) |
-| A3 | Starts on boot, the platform's own way | 🟡 | systemd --user / cron / LaunchAgent / Termux:Boot / HKCU Run + VBS shim are written; live test ran with `AUTOSTART=0` |
+| A1 | One owner action joins a device: one pasted line or one double-click | ✅ Linux, Windows · 🟡 macOS, Android, Pi | Live: VPS and WSL-Linux joined with `curl … \| sh`; Windows joined with the real `irm … \| iex` line (isolated profile). macOS/Android/Pi paths written and syntax-checked, not run on those devices |
+| A2 | Joiner installs its own prerequisites, after saying what it will install | ✅ llama.cpp (Linux, Windows) · 🟡 Python auto-install | Live on Windows + Linux: plan printed first, pinned llama.cpp downloaded, verified to run, installed to `~/.swarm/llama`. A build that cannot run is removed, not left broken. Python auto-install (winget/pkg) not exercised: Python was present |
+| A3 | Starts on boot, the platform's own way | ✅ Windows, Linux (systemd) · 🟡 macOS, Termux, cron | Live: Windows HKCU Run + hidden VBS watchdog; Linux systemd --user unit enabled + active |
 | A4 | Every node runs the same llama.cpp build (the hub pins one) | ✅ | Found live: winget's b10615 vs release b11190 → `RPC server version mismatch`. Hub now pins a tag; joiners install exactly it into `~/.swarm/llama`; agent prefers it |
 | A5 | After joining, the device never needs touching: self-update | ✅ | VPS agent swapped itself 22 s after the hub's code changed, kept its hub/node identity (code-hash compare + config carried over) |
-| A6 | One-line leave that removes only agent files | 🟡 | Printed by every joiner; never deletes a hub's `owner.key`/`hub.db` sharing `~/.swarm` (bug caught on the VPS) |
+| A6 | One-line leave that removes only agent files | ✅ | Live on Windows + Linux: after the printed leave line, no process, no Run key / unit, no agent files. Never touches a hub's `owner.key` / `hub.db` |
 | A7 | Seed kit: a zip that turns a USB stick / SD card / old phone into a joiner for every OS | 🟡 | `/join/seed-kit.zip` built + tested (contents, exec bits, baked config); not yet plugged into a real stranger PC |
 | A8 | A device that cannot compute can still *carry* the seed and serve it over Wi-Fi | 🟡 | `swarm-agent.pyz --seed` serves the kit + joiners on :8788; not yet run on a real phone |
 | A9 | USB autorun ("plug in and it starts") | ⛔ | Every modern OS blocks it (Windows since 2011). Nearest honest version: double-click `JOIN-*` on the stick |
@@ -137,9 +137,9 @@ as the work it describes.
 | # | Device class | Status | Notes |
 |---|---|---|---|
 | E1 | Windows x64 laptop/desktop, Intel/AMD GPU via Vulkan | ✅ | Laptop, Iris Xe, live |
-| E2 | Linux x64 server, CPU | ✅ | VPS, live |
+| E2 | Linux x64 (server, desktop) | ✅ | VPS (Ubuntu) and WSL (Kali, kernel 6.6, systemd) — both live |
 | E3 | NVIDIA GPU box | 🟡 | Joiners install the Vulkan build (works on NVIDIA drivers); CUDA builds not wired |
-| E4 | Android phone (Termux) | 🟡 | Joiner path + android-arm64 llama.cpp release written; S24 offline during the run |
+| E4 | Android phone (Termux) | 🟡 | Joiner path written (pkg Python install, Termux:Boot watchdog, arm64 llama.cpp, code worker by default); emulated as `--emulate phone` in the fleet simulation. The termux-docker run is scripted (`scripts/docker_fleet.py`) but Docker Desktop on this machine cannot start (a Windows fault: every AF_UNIX socket file it creates becomes undeletable) |
 | E5 | Raspberry Pi / ARM Linux | 🟡 | ubuntu-arm64 release selected by the joiner; untested |
 | E6 | Mac (Metal) | 🟡 | macos-arm64/x64 release; untested |
 | E7 | Carrier-only (USB stick, dead phone) | 🟡 | Seed kit (A7/A8) |
@@ -155,7 +155,7 @@ as the work it describes.
 | F4 | Devices back off when used or low on battery; `--dedicated` for compute-only machines | ✅ logic · 🟡 phones | Welfare gate; dedicated keeps battery protection |
 | F5 | Scheduled hub backups | ✅ | Successor replicas ARE continuous off-machine backups; `/api/backup` for manual copies |
 | F6 | Hub shutdown is crash-free | ✅ | Found: closing sqlite under a long-poll thread was an access violation; fixed + test |
-| F7 | Multi-hub federation | ⬜ | Later |
+| F7 | Multi-hub federation (separate swarms sharing work) | — not a goal | One owner = one swarm. The resilience federation was meant to buy is delivered by the holographic hub (H6–H9); linking someone else's swarm is a different product |
 
 ## G. Decisions pending the owner
 
@@ -184,6 +184,11 @@ as the work it describes.
 | Batch map across both nodes | ✅ 24/24 in 4.5 s |
 | Embeddings via hub → laptop Ollama | ✅ 3×1024-dim in 8.6 s |
 | VPS left as found | ✅ test worker stopped, 1.4 GB weight cache removed, hub kept running |
+
+| Real Windows installer (isolated profile) | ✅ plan printed, pinned llama.cpp verified, hidden start-at-logon, registered in ~90 s (first measurement), parked while the owner typed, took a hub replica; watchdog restart ~10 s; leave line left nothing |
+| Real Linux installer (WSL Kali) | ✅ systemd unit enabled + active, llama.cpp verified, registered; killed → systemd restarted it |
+| Cross-OS batch (Linux hub; Linux + Windows workers) | ✅ 40/40, Linux 29 / Windows 11 |
+| Browser worker in a real browser | ✅ joined; paused itself at 14% battery; results byte-identical to Python's |
 
 **What the numbers say:** over the internet, pooling is a capacity tool — it
 runs models no single device can hold, slowly. On a home LAN (~1–2 ms) the

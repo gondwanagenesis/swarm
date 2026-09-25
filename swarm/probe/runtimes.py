@@ -414,16 +414,33 @@ def discover_inference(list_devices: bool = True) -> Tuple[Dict[str, Any], List[
 
     try:
         bins = find_llama_binaries()
+        # A binary that exists is not a binary that runs (a glibc build on
+        # musl, an arm64 build on x86, a missing .so). Only what actually
+        # starts here is offered; the rest is an anomaly with the reason.
+        if "llama_server" in bins:
+            version = llama_version(bins["llama_server"])
+            if version is None:
+                anomalies.append(
+                    Anomaly("runtimes.llama", f"{bins.pop('llama_server')} does not run on this machine; not offered")
+                )
+            else:
+                llama["version"] = version
+                llama["build"] = llama_build(version)
+        if "llama_rpc" in bins:
+            help_text = run_bounded([bins["llama_rpc"], "--help"], timeout=30.0, merge_stderr=True)
+            if not help_text or "--port" not in help_text:
+                anomalies.append(
+                    Anomaly("runtimes.llama", f"{bins.pop('llama_rpc')} does not run on this machine; not offered")
+                )
+            else:
+                llama["rpc_cache"] = "--cache" in help_text
         llama.update(bins)
         if "llama_server" in bins:
             runtimes.append("llama_server")
-            llama["version"] = llama_version(bins["llama_server"])
-            llama["build"] = llama_build(llama["version"])
             if list_devices:
                 llama["devices"] = llama_devices(bins["llama_server"])
         if "llama_rpc" in bins:
             runtimes.append("llama_rpc")
-            llama["rpc_cache"] = rpc_supports_cache(bins["llama_rpc"])
         if "llama_server" in bins:
             models.extend(local_gguf_models())
     except Exception as exc:

@@ -120,6 +120,7 @@ def test_old_hub_steps_aside_for_a_newer_epoch(tmp_path):
         old.stop()
 
 
+@pytest.mark.slow
 def test_hub_failover_end_to_end(tmp_path, monkeypatch):
     """Kill the hub; a successor becomes the hub; the fleet follows; work flows."""
     monkeypatch.setattr(runtimes_mod, "find_llama_binaries", lambda: {})
@@ -189,10 +190,11 @@ def test_hub_failover_end_to_end(tmp_path, monkeypatch):
             a.stop_worker()  # also ends the heartbeat loop, so nobody restarts the hub
         for t in beats:
             t.join(timeout=10)
-        proc = agents["a"]._hub_proc or promoted
-        if proc is not None:
-            proc.terminate()
-            proc.wait(timeout=10)
+        # retire every hub any node started (a lost promotion race included)
+        for proc in {id(p): p for p in (promoted, agents["a"]._hub_proc, agents["b"]._hub_proc) if p is not None}.values():
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=10)
 
 
 @pytest.mark.parametrize("dead_for,expected", [(0.5, "wait"), (10.0, "promote")])
