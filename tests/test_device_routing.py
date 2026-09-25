@@ -253,7 +253,8 @@ def test_v2_database_upgrades_and_keeps_its_work(tmp_path):
     conn.row_factory = sqlite3.Row
     q = WorkQueue(conn)
 
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 3
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 4
+    assert {"failed", "priority"} <= {r["name"] for r in conn.execute("PRAGMA table_info(bags)")}
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
     assert "device_class" in cols
     assert {r["name"] for r in conn.execute("PRAGMA table_info(bags)")} >= {"device_class"}

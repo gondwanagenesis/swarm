@@ -61,13 +61,15 @@ stated. Nothing here is marked proven because it looked right.
 | Tail muscle (M3) | **Proven** | Hedging (>75% bag, >1.5× median), earned tiers, suspension after 3 consecutive expiries. |
 | Contract gate (M4) | **Proven** | Contract-driven entrypoint + comparison; candidate code runs in a **subprocess**, not restricted-`exec`. Timeout, crash, and forged-stdout all fail closed. Known-bad rejection asserted in CI. |
 | LAN discovery | **Proven** | Raw mDNS PTR+SRV+A; a `DiscoveryLoop` resolved a live announcing hub over real multicast. Degrades to "no peers" — never crashes, never guesses. |
-| Consent membrane (M4.5) | **Proven** | Enrollment tokens, one-click invite, per-invite bundle. Discovery finds candidates; it never enrolls. |
-| Welfare loop | **Proven** | Backs off on typing / battery; demos must opt out explicitly and loudly. |
-| Gene expression (workshop) | **Proven** | Self-edits only through a sandboxed gate; every byte content-hashed; rollback restores exact bytes. |
-| Real workloads | **Proven** | `embed` runs a live local model (bge-m3, 1024-dim) and is deterministic per (model, text), so idempotency and content addressing hold. Fails closed with no runtime — never a synthetic vector. |
-| Accelerated compute (GPU tier) | **Built, unproven here** | `matmul` degrades torch-CUDA → numpy/BLAS → torch-CPU → pure Python and **reports which tier actually ran**. This machine has an Intel Iris Xe with no bound runtime and CPU-only torch, so the CUDA path has never executed. It needs a CUDA box to earn "proven". |
+| Consent membrane (M4.5) | **Proven** | Enrollment tokens, one-line joiners, seed kits. Off-loopback hubs are **secure by default**: owner key, per-node keys, tokens (`hub/auth.py`). Discovery finds candidates; it never enrolls. |
+| Welfare loop | **Proven** | Backs off on typing / battery; `--dedicated` for machines that exist to compute (battery rules still apply). |
+| Gene expression (workshop) | **Proven** | Self-edits only through a sandboxed gate, owner-key only; every byte content-hashed; rollback restores exact bytes. |
+| Real workloads | **Proven** | `embed` and `chat` run on the node's own runtime (Ollama), routed by `model:<name>` to the node that actually holds the model. Fail closed with no runtime. |
+| The front door (`/v1`) | **Proven live** | OpenAI-compatible chat/embeddings/models on the hub; any tool with a base-URL setting uses the fleet. Answered live through a VPS hub from a laptop GPU. |
+| The teeth (M5) | **Proven live** | Models run on one node when they fit (never sharded then), pooled over several via llama.cpp RPC — split from measured free memory — when they do not. Live: Qwen3.5-4B split laptop GPU + VPS CPU across the internet at 1.6–2.0 tok/s (324 ms link; the same model alone on the laptop: 5.4–7). Pooling buys capacity, not speed — numbers in `REQUIREMENTS.md`. |
+| General compute (`swarm map`) | **Proven (tests)** | Your Python function over a list, across every node, results in order; failures retried, then reported. |
+| Accelerated compute (GPU tier) | **Proven via Vulkan** | llama.cpp's Vulkan backend on the laptop's Iris Xe (live). The `matmul` torch-CUDA tier is still unexecuted — no CUDA box yet. |
 | Adapter synthesis (M4 Tier 1) | **Built, unproven here** | Loop, budget cap, and promotion-only-after-gate are wired and tested against scripted LLMs. No run against a live model has been recorded. |
-| The teeth (M5) | **Planner proven, execution absent** | Exact DP contiguous-chain min-max partition; reports `bottleneck_ms` and `latency_ms` separately. It **does not run models** — no weights, no tensor transport. |
 | Collective motion (M6) | **Not started** | Multi-model packing, adaptive replication. |
 
 **The honest summary:** the scheduling and measurement organism is real and
@@ -82,7 +84,35 @@ next milestones, not footnotes.
 
 `GET /api/fleet-power` — proven vs fallback-tier totals, never summed into a fantasy number. On the dashboard too.
 
-## Take part
+## Take part — the easy way
+
+```sh
+# the hub (always-on box; binds only where you tell it, secure by default off-loopback)
+python -m swarm.hub.server --host <tailscale-or-lan-ip>
+# -> prints where the owner key lives; open http://<hub>:8777/?key=<owner key>
+```
+
+Then open **`/join`** on the hub: one copy-paste line per platform (Linux,
+macOS, Pi, Android-Termux, Windows) and a **seed kit** zip for USB sticks
+and old phones. The joiner says what it will install, installs Python and
+the fleet's pinned llama.cpp build where it can, starts on boot, and turns
+on self-update. After that the device never needs touching.
+
+Use it from anything that speaks OpenAI:
+
+```sh
+export OPENAI_BASE_URL=http://<hub>:8777/v1  OPENAI_API_KEY=<owner key>
+python -m swarm.cli models
+python -m swarm.cli chat Qwen3.5-4B-Q4_K_M "hello"
+python -m swarm.cli map my_fn.py inputs.jsonl -o results.jsonl
+```
+
+Drop GGUF files into `~/.swarm/models` on any node with llama.cpp; the
+fleet serves them on demand, splitting across nodes only when a model does
+not fit on one. Progress against the goals lives in
+[`REQUIREMENTS.md`](REQUIREMENTS.md).
+
+## Take part — by hand
 
 ```sh
 # on the hub tissue

@@ -4,7 +4,10 @@
   2. full hardware probe (never raises, never hangs)
   3. fallback benchmarks at the floor the tower reached
   4. measure the link to the hub (RTT, bandwidth)
-  5. register all of it with the hub, then heartbeat
+  5. discover inference runtimes (Ollama, llama.cpp, GGUF files)
+  6. register all of it with the hub, then heartbeat
+  7. with --work: long-poll for tasks; with llama.cpp present: reconcile the
+     services the hub wants (rpc-server / llama-server for pooled models)
 
 Everything is stdlib. Everything degrades: hub unreachable -> log and keep
 breathing; benchmark crash -> anomaly, not exit.
@@ -13,11 +16,15 @@ breathing; benchmark crash -> anomaly, not exit.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import http.client
 import json
+import os
+import socket
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -36,6 +43,61 @@ HEARTBEAT_SECONDS = 30.0
 IDLE_BACKOFF_MAX = 10.0
 LEASE_RENEW_FRACTION = 1.0 / 3.0
 WELFARE_CHECK_S = 30.0
+PULL_WAIT_S = 20.0
+SERVICE_WAIT_S = 20.0
+HONE_INTERVAL_S = 600.0
+
+
+def _state_dir() -> Path:
+    base = Path(os.environ.get("USERPROFILE") or str(Path.home())) if os.name == "nt" else Path.home()
+    return base / ".swarm"
+
+
+def _local_addresses() -> List[str]:
+    """Addresses peers might reach this machine on: the LAN route and, if
+    present, the Tailscale route. Found by asking the kernel which interface
+    would carry traffic (UDP connect; no packet is sent). Never loopback."""
+    found: List[str] = []
+    for target in (("8.8.8.8", 53), ("100.100.100.100", 53)):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.settimeout(0.5)
+            sock.connect(target)
+            ip = sock.getsockname()[0]
+            if ip and not ip.startswith("127.") and ip not in found:
+                found.append(ip)
+        except Exception:
+            pass
+        finally:
+            sock.close()
+    return found
+
+
+class _KeyStore:
+    """Per-(hub, node) keys the hub issued, in the node's state dir, 0600."""
+
+    def __init__(self, path: Optional[Path] = None) -> None:
+        self.path = path or (_state_dir() / "node_keys.json")
+
+    def _load(self) -> Dict[str, str]:
+        try:
+            return dict(json.loads(self.path.read_text(encoding="utf-8")))
+        except Exception:
+            return {}
+
+    def get(self, hub: str, node_id: str) -> Optional[str]:
+        return self._load().get(f"{hub}|{node_id}")
+
+    def put(self, hub: str, node_id: str, key: str) -> None:
+        data = self._load()
+        data[f"{hub}|{node_id}"] = key
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(data, indent=1), encoding="utf-8")
+            with contextlib.suppress(OSError):
+                os.chmod(self.path, 0o600)
+        except OSError:
+            pass
 
 
 def bundled_config() -> Dict[str, Any]:
@@ -72,6 +134,8 @@ class Agent:
         role: str = "node",
         ignore_welfare: bool = False,
         self_update: bool = False,
+        dedicated: bool = False,
+        services: bool = False,
     ) -> None:
         parsed = urlparse(hub_url if "://" in hub_url else "http://" + hub_url)
         self.hub_host = parsed.hostname or "127.0.0.1"
@@ -86,17 +150,41 @@ class Agent:
         self.last_bench_at = 0.0
         self.ignore_welfare = ignore_welfare
         self.self_update = self_update
+        self.dedicated = dedicated
+        self.services_enabled = services
+        self.hub_key = f"{self.hub_host}:{self.hub_port}"
+        self.keys = _KeyStore()
+        self.node_key: Optional[str] = None
+        self.last_status: Optional[int] = None
+        self.inference: Dict[str, Any] = {}
+        self.service_manager: Any = None
+        self._service_thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
 
     def _post(self, path: str, payload: Dict[str, Any], timeout: float = 10.0) -> Optional[Dict[str, Any]]:
+        self.last_status = None
         try:
             body = json.dumps(payload).encode("utf-8")
+            headers = {"Content-Type": "application/json"}
+            if self.node_id and self.node_key:
+                headers["X-Swarm-Node"] = self.node_id
+                headers["X-Swarm-Node-Key"] = self.node_key
             conn = http.client.HTTPConnection(self.hub_host, self.hub_port, timeout=timeout)
-            conn.request("POST", path, body=body, headers={"Content-Type": "application/json"})
+            conn.request("POST", path, body=body, headers=headers)
             resp = conn.getresponse()
             raw = resp.read()
             conn.close()
+            self.last_status = resp.status
+            if resp.status == 401 and path != "/api/register":
+                # The hub no longer knows our key (revoked, or a fresh hub db).
+                self.registered = False
             if resp.status != 200:
+                if resp.status in (401, 403):
+                    try:
+                        detail = json.loads(raw.decode("utf-8")).get("error")
+                    except Exception:
+                        detail = raw[:200]
+                    print(f"agent: hub refused {path} ({resp.status}): {detail}", file=sys.stderr, flush=True)
                 return None
             return json.loads(raw.decode("utf-8"))
         except Exception:
@@ -121,6 +209,14 @@ class Agent:
             benches = run_floor_benchmarks()
             self.last_bench_at = time.time()
 
+        try:
+            from ..probe.runtimes import discover_inference
+
+            self.inference, inference_anomalies = discover_inference()
+            profile.anomalies.extend(inference_anomalies)
+        except Exception:
+            self.inference = {}
+
         payload = {
             "profile": to_dict(profile),
             "capability": to_dict(capability),
@@ -129,12 +225,73 @@ class Agent:
             "bindings": bindings,
             "token": self.token,
             "role": self.role,
+            "inference": self.inference,
+            "addresses": _local_addresses(),
+            "dedicated": self.dedicated,
         }
-        resp = self._post("/api/register", payload)
+        # A key from an earlier run lets us re-register without a token (the
+        # token may have expired long ago; the key is the standing consent).
+        self.node_key = self.keys.get(self.hub_key, self.node_id) or self.node_key
+        resp = self._post("/api/register", payload, timeout=30.0)
+        if resp is None and self.last_status == 401 and self.node_key:
+            self.node_key = None  # stale key: fall back to the token
+            resp = self._post("/api/register", payload, timeout=30.0)
         if resp and resp.get("ok"):
             self.registered = True
+            if resp.get("node_key"):
+                self.node_key = str(resp["node_key"])
+                self.keys.put(self.hub_key, self.node_id, self.node_key)
             self._post("/api/link", to_dict(link))
+            self._ensure_services()
         return self.registered
+
+    # -- services (pooled models) -----------------------------------------------
+
+    def _ensure_services(self) -> None:
+        """Start the service reconcile loop once, if this node can run any
+        llama.cpp service at all. A node without llama.cpp never polls."""
+        if not self.services_enabled or self._service_thread is not None:
+            return
+        llama = (self.inference or {}).get("llama") or {}
+        binaries = {k: v for k, v in llama.items() if k in ("llama_rpc", "llama_server") and v}
+        if not binaries:
+            return
+        from ..probe.runtimes import resolve_local_model
+        from .services import ServiceManager
+        from .welfare import welfare_gate
+
+        def welfare() -> Dict[str, Any]:
+            if self.ignore_welfare:
+                return {"allowed": True}
+            return welfare_gate(dedicated=self.dedicated)
+
+        self.service_manager = ServiceManager(binaries, resolve_local_model, welfare=welfare)
+        self._service_thread = threading.Thread(target=self._service_loop, daemon=True, name="swarm-services")
+        self._service_thread.start()
+
+    def _service_loop(self) -> None:
+        version: Optional[int] = None
+        statuses: List[Dict[str, Any]] = []
+        while not self._stop.is_set():
+            settling = any(s.get("state") == "starting" for s in statuses)
+            payload: Dict[str, Any] = {
+                "node_id": self.node_id,
+                "services": statuses,
+                "version": version,
+                "wait_s": 0.0 if settling else SERVICE_WAIT_S,
+            }
+            resp = self._post("/api/services/sync", payload, timeout=SERVICE_WAIT_S + 15.0)
+            if resp is None or not resp.get("ok"):
+                self._stop.wait(5.0)
+                continue
+            version = resp.get("version")
+            try:
+                statuses = self.service_manager.reconcile(resp.get("desired") or [])
+            except Exception as exc:
+                print(f"[services] reconcile failed safely: {exc}", flush=True)
+                statuses = []
+            if any(s.get("state") == "starting" for s in statuses):
+                self._stop.wait(1.0)
 
     def heartbeat_forever(self) -> None:
         watcher: Optional[HotplugWatcher] = None
@@ -154,7 +311,7 @@ class Agent:
                 except Exception:
                     welfare = None
                 resp = self._post("/api/heartbeat", {"node_id": self.node_id, "welfare": welfare})
-                if resp is None or not resp.get("ok"):
+                if resp is None or not resp.get("ok") or not self.registered:
                     self.registered = False
                     self.probe_and_register()
                 elif self.do_bench and (time.time() - self.last_bench_at) > self.rebench_interval:
@@ -183,19 +340,43 @@ class Agent:
         watcher.on_attach(self._on_attachment)
         watcher.start()
 
+        cfg = bundled_config()
+        hub_url = cfg.get("hub") or f"http://{self.hub_host}:{self.hub_port}"
+        token = str(cfg.get("token") or self.token or "")
+        own_bundle: Optional[bytes] = None
+        try:
+            if sys.argv and sys.argv[0].endswith(".pyz"):
+                own_bundle = Path(sys.argv[0]).read_bytes()
+        except OSError:
+            own_bundle = None
+        from .join_scripts import render_posix, render_powershell
+        from .mdns import primary_ip
+
+        seed_url = f"http://{primary_ip() or '127.0.0.1'}:8788"
+
         def serve(page: str) -> None:
             import socketserver
 
             class Handler(
                 __import__("http.server", fromlist=["BaseHTTPRequestHandler"]).BaseHTTPRequestHandler
             ):
-                def do_GET(self):
-                    body = page.encode("utf-8")
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                def _send(self, body: bytes, ctype: str, status: int = 200) -> None:
+                    self.send_response(status)
+                    self.send_header("Content-Type", ctype)
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
+
+                def do_GET(self):
+                    path = self.path.split("?", 1)[0]
+                    if path == "/swarm-agent.pyz" and own_bundle:
+                        self._send(own_bundle, "application/octet-stream")
+                    elif path == "/join.sh" and own_bundle:
+                        self._send(render_posix(hub_url, token, True, seed_url).encode("utf-8"), "text/x-shellscript")
+                    elif path == "/join.ps1" and own_bundle:
+                        self._send(render_powershell(hub_url, token, False, seed_url).encode("utf-8"), "text/plain")
+                    else:
+                        self._send(page.encode("utf-8"), "text/html; charset=utf-8")
 
                 def log_message(self, *args):
                     return
@@ -207,13 +388,27 @@ class Agent:
             server = Server(("0.0.0.0", 8788), Handler)
             server.serve_forever()
 
-        hub_url = f"http://{self.hub_host}:{self.hub_port}"
+        if own_bundle:
+            kit = (
+                "<h2>Join from this seed</h2>"
+                "<p>Linux / Mac / Android-Termux:</p>"
+                f"<pre>curl -fsSL {seed_url}/join.sh | sh</pre>"
+                "<p>Windows (PowerShell):</p>"
+                f"<pre>irm {seed_url}/join.ps1 | iex</pre>"
+                f"<p>Or download <a href='/swarm-agent.pyz'>swarm-agent.pyz</a> and run "
+                "<code>python swarm-agent.pyz --work</code>.</p>"
+            )
+        else:
+            kit = f"<p><a href='{hub_url}/invite'>Join this swarm</a></p>"
         page = (
-            "<html><body style='font-family:sans-serif;padding:2em'>"
-            "<h1>Swarm seed detected</h1>"
-            "<p>This device attached to a swarm seed. One click joins the swarm — "
-            "the agent runs in userspace, never installs without your consent.</p>"
-            f"<p><a href='{hub_url}/invite'>Join this swarm</a></p>"
+            "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'></head>"
+            "<body style='font-family:sans-serif;padding:1.5em;max-width:640px'>"
+            "<h1>Swarm seed</h1>"
+            "<p>This device carries a swarm seed. Running one of the lines below on YOUR device "
+            "joins it to the swarm: a userspace agent that measures the machine and shares spare "
+            "cycles, backs off when you use it, and prints its own uninstall line. Nothing runs "
+            "until you run it.</p>"
+            f"{kit}<p style='color:#777;font-size:12px'>hub: {hub_url}</p>"
             "</body></html>"
         )
         threading.Thread(target=serve, args=(page,), daemon=True, name="swarm-seed-serve").start()
@@ -287,17 +482,21 @@ class Agent:
         if total_lease <= 0:
             return
         if time.time() - started_at >= total_lease * LEASE_RENEW_FRACTION:
-            bag_id = tasks[0]["bag_id"]
-            seqs = [int(t["seq"]) for t in tasks if t["bag_id"] == bag_id]
-            self._post(
-                "/api/tasks/renew",
-                {
-                    "node_id": self.node_id,
-                    "bag_id": bag_id,
-                    "seqs": seqs,
-                    "lease_seconds": total_lease,
-                },
-            )
+            # A chunk can span bags; every bag's leases get renewed, not just
+            # the first one's.
+            by_bag: Dict[str, List[int]] = {}
+            for t in tasks:
+                by_bag.setdefault(t["bag_id"], []).append(int(t["seq"]))
+            for bag_id, seqs in by_bag.items():
+                self._post(
+                    "/api/tasks/renew",
+                    {
+                        "node_id": self.node_id,
+                        "bag_id": bag_id,
+                        "seqs": seqs,
+                        "lease_seconds": total_lease,
+                    },
+                )
 
     def work_forever(self, poll_seconds: float = 2.0) -> None:
         from .welfare import welfare_gate
@@ -305,9 +504,10 @@ class Agent:
         idle = 0.0
         blocked_logged = False
         hone = None
+        last_hone = time.time()
         while not self._stop.is_set():
             if not self.ignore_welfare:
-                welfare = welfare_gate()
+                welfare = welfare_gate(dedicated=True) if self.dedicated else welfare_gate()
                 if not welfare["allowed"]:
                     if not blocked_logged:
                         print(f"[welfare] worker parked: {welfare['reason']}", flush=True)
@@ -315,7 +515,15 @@ class Agent:
                     time.sleep(max(poll_seconds, WELFARE_CHECK_S))
                     continue
                 blocked_logged = False
-            resp = self._post("/api/tasks/pull", {"node_id": self.node_id})
+            long_poll = idle > 0
+            resp = self._post(
+                "/api/tasks/pull",
+                {"node_id": self.node_id, "wait_s": PULL_WAIT_S if long_poll else 0.0},
+                timeout=PULL_WAIT_S + 15.0 if long_poll else 10.0,
+            )
+            if resp is None and not self.registered:
+                self._stop.wait(poll_seconds)
+                continue
             tasks = (resp or {}).get("tasks") or []
             if not tasks:
                 # idle rung: burn spare cycles on self-knowledge, not tokens
@@ -323,23 +531,36 @@ class Agent:
 
                 if hone is None:
                     hone = IdleHone(self.node_id)
-                try:
-                    report = hone.sharpen(self)
-                    if report.get("ran"):
-                        print(f"[idle] sharpened: {report['ran']}", flush=True)
-                except Exception:
-                    pass
+                # Paced: a benchmark on every empty poll would turn an idle
+                # phone into a hand warmer. Self-knowledge, not self-harm.
+                if time.time() - last_hone >= HONE_INTERVAL_S:
+                    last_hone = time.time()
+                    try:
+                        report = hone.sharpen(self)
+                        if report.get("ran"):
+                            print(f"[idle] sharpened: {report['ran']}", flush=True)
+                    except Exception:
+                        pass
                 if self.self_update:
                     from .updater import apply_update
 
                     try:
-                        outcome = apply_update(f"http://{self.hub_host}:{self.hub_port}")
+                        headers = (
+                            {"X-Swarm-Node": self.node_id, "X-Swarm-Node-Key": self.node_key}
+                            if self.node_key
+                            else None
+                        )
+                        outcome = apply_update(
+                            f"http://{self.hub_host}:{self.hub_port}", headers=headers, node_id=self.node_id
+                        )
                         if outcome not in ("current", "no-offer"):
                             print(f"[update] {outcome}", flush=True)
                     except Exception as exc:
                         print(f"[update] failed safely: {exc}", flush=True)
                 idle = min(IDLE_BACKOFF_MAX, idle * 2 + poll_seconds)
-                time.sleep(min(idle, poll_seconds))
+                if not (long_poll and resp is not None):
+                    # a long-poll already waited at the hub; no extra nap
+                    time.sleep(min(idle, poll_seconds))
                 continue
             idle = 0.0
             started_at = time.time()
@@ -357,6 +578,78 @@ class Agent:
 
     def stop_worker(self) -> None:
         self._stop.set()
+
+
+def lower_own_priority() -> bool:
+    """Make this agent — and everything it launches — yield to the owner.
+
+    Children inherit it (POSIX nice; Windows BELOW_NORMAL is inherited by
+    child processes), so map jobs and llama.cpp never compete with the apps
+    you are actually using. Returns whether the OS accepted it."""
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            # The pseudo-handle is -1; without a pointer restype it is
+            # truncated to 32 bits on 64-bit Windows and the call fails.
+            kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+            handle = ctypes.c_void_p(kernel32.GetCurrentProcess())
+            return bool(kernel32.SetPriorityClass(handle, 0x00004000))
+        os.nice(10)
+        return True
+    except Exception:
+        return False
+
+
+class SingleInstance:
+    """One agent per (machine, node identity). Launchers restart the agent
+    if it dies; this lock is what makes that safe — a second copy (a
+    watchdog racing a self-update restart, a double autostart) waits briefly
+    for the lock, then exits instead of doubling the node."""
+
+    def __init__(self, name: str = "agent") -> None:
+        self.path = _state_dir() / f"{name}.lock"
+        self._fh: Any = None
+
+    def acquire(self, wait_s: float = 15.0) -> bool:
+        deadline = time.time() + wait_s
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        while True:
+            fh = open(self.path, "a+")  # noqa: SIM115 - held for the process lifetime
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self._fh = fh
+                return True
+            except OSError:
+                fh.close()
+                if time.time() >= deadline:
+                    return False
+                time.sleep(1.0)
+
+
+def _redirect_output(path: str, max_bytes: int = 5 * 1024 * 1024) -> None:
+    """Send prints to a log file, rotating once past `max_bytes` so an
+    always-on phone never fills its storage with agent chatter."""
+    try:
+        target = Path(path).expanduser()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists() and target.stat().st_size > max_bytes:
+            os.replace(target, target.with_suffix(target.suffix + ".1"))
+        fh = open(target, "a", buffering=1, encoding="utf-8", errors="replace")  # noqa: SIM115 - lives as stdout
+        sys.stdout = fh
+        sys.stderr = fh
+        print(f"--- agent start {time.strftime('%Y-%m-%d %H:%M:%S')} ---", flush=True)
+    except Exception:
+        pass
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -388,7 +681,43 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="poll hub for updated agent bundles and hot-swap when offered",
     )
+    parser.add_argument(
+        "--dedicated",
+        action="store_true",
+        default=bool(cfg.get("dedicated")),
+        help="this machine exists to compute (old phone on a charger, GPU box): "
+        "work even while someone is at the keyboard; battery rules still apply",
+    )
+    parser.add_argument(
+        "--node-id",
+        default=None,
+        help="override the persisted node id (e.g. two agents on one machine for testing)",
+    )
+    parser.add_argument(
+        "--no-services",
+        action="store_true",
+        help="never run llama.cpp services for pooled models on this node",
+    )
+    parser.add_argument(
+        "--log",
+        default=None,
+        help="append output to this file (used by autostart, where there is no console)",
+    )
+    parser.add_argument(
+        "--normal-priority",
+        action="store_true",
+        help="do not lower this agent's CPU priority (default: yield to the owner's apps)",
+    )
     args = parser.parse_args(argv)
+    if args.log:
+        _redirect_output(args.log)
+    if not args.normal_priority:
+        lower_own_priority()
+    if not args.once:
+        lock = SingleInstance("agent-" + args.node_id if args.node_id else "agent")
+        if not lock.acquire():
+            print("agent: another agent already runs this node; exiting", file=sys.stderr, flush=True)
+            return 0
 
     # No --hub given: look for one on the LAN before falling back to the
     # loopback default. Discovery only ever yields a CANDIDATE address —
@@ -413,9 +742,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     agent = Agent(
         hub_url=hub_url,
         bench=not args.no_bench,
+        node_id=args.node_id,
         token=args.token,
         role="seed" if args.seed else "node",
         self_update=args.self_update,
+        dedicated=args.dedicated,
+        services=not args.no_services,
     )
     t0 = time.time()
     ok = agent.probe_and_register()
@@ -427,6 +759,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
     else:
         print(f"agent: registered as {agent.node_id[:8]} ({agent.role}) in {elapsed:.1f}s")
+        inf = agent.inference or {}
+        if inf.get("runtimes"):
+            names = [m.get("name") for m in inf.get("models") or []]
+            print(f"agent: runtimes {inf['runtimes']}; models {names}")
     if args.seed:
         print("agent: seed posture — watching for attached devices, invite page on :8788")
         agent.run_seed()

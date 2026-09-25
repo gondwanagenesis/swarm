@@ -39,7 +39,11 @@ Measurements only. Nothing enters the schedulable pool by declaration.
 | `swarm/bench` | fallback calibration benchmarks | stdlib |
 | `swarm/agent` | node daemon | stdlib |
 | `swarm/transport` | link measurement | stdlib |
-| `swarm/hub` | registry (sqlite3) + server (http.server) + dashboard | stdlib today; FastAPI extras reserved in pyproject |
+| `swarm/hub` | registry (sqlite3) + server (http.server) + dashboard + `auth` (owner/node keys) + `inference` (model placement, deployments) + `gateway` (OpenAI `/v1`) + `join` (joiners, seed kit) | stdlib today; FastAPI extras reserved in pyproject |
+| `swarm/probe/runtimes.py` | discovers Ollama models, llama.cpp binaries + device free memory, GGUF files | stdlib |
+| `swarm/agent/services.py` | reconciles hub-desired llama.cpp services (rpc-server / llama-server) | stdlib |
+| `swarm/agent/join_scripts.py` | POSIX + PowerShell joiners, seed kit builder | stdlib |
+| `swarm/cli.py` | owner CLI: status, models, chat, deploy, plan, map, join | stdlib |
 | `swarm/integrator` | M4 placeholder — do not build before M2/M3 | — |
 | `contracts/` | home of capability contracts + known-good/known-bad (M4) | — |
 | `tests/` | pytest, dev-only dependency | pytest |

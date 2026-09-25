@@ -17,6 +17,7 @@ dev = ["pytest>=7"]
 [project.scripts]
 swarm-hub = "swarm.hub.server:main"
 swarm-agent = "swarm.agent.daemon:main"
+swarm = "swarm.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["swarm*"]

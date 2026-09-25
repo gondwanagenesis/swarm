@@ -83,12 +83,32 @@ _MIGRATION_V3 = [
     "ALTER TABLE tasks ADD COLUMN device_class TEXT",
 ]
 
+# v4: failures are first-class. A task whose op raised is retried (not
+# silently "done" with an error for a payload) and, after MAX_TASK_ATTEMPTS,
+# closed as failed with the error kept. Interactive bags (the OpenAI gateway)
+# carry a priority so a chat request never queues behind a batch job.
+_MIGRATION_V4 = [
+    "ALTER TABLE bags ADD COLUMN failed INTEGER DEFAULT 0",
+    "ALTER TABLE bags ADD COLUMN priority INTEGER DEFAULT 0",
+    "ALTER TABLE tasks ADD COLUMN last_error TEXT",
+]
+
 _MIGRATIONS = {
     2: _MIGRATION_V2,
     3: _MIGRATION_V3,
+    4: _MIGRATION_V4,
 }
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+
+#: An op failure (the node ran it and it raised) is retried up to this many
+#: attempts in total, then the task closes as failed. Lease expiries count
+#: toward the same budget.
+MAX_TASK_ATTEMPTS = 3
+
+#: Ops that must not be batched: one interactive request per lease, so a
+#: second request is free to go to a different node immediately.
+OP_MAX_CHUNK = {"chat": 1}
 
 HEDGE_FRACTION_GATE = 0.75
 HEDGE_ELAPSED_MULTIPLE = 1.5
@@ -115,6 +135,12 @@ class WorkQueue:
     def __init__(self, conn: sqlite3.Connection, lock: Optional[threading.RLock] = None) -> None:
         self.conn = conn
         self._lock: threading.RLock = lock or threading.RLock()
+        # Long-poll plumbing. Deliberately separate from the sqlite RLock: a
+        # waiter never holds the database lock while it sleeps.
+        self._work_cv = threading.Condition()
+        self._work_seq = 0
+        self._result_cv = threading.Condition()
+        self._result_seq = 0
         self.conn.executescript(_SCHEMA)
         version = self.conn.execute("PRAGMA user_version").fetchone()[0]
         if version < SCHEMA_VERSION:
@@ -136,6 +162,7 @@ class WorkQueue:
         idem_keys: List[str],
         device_class: Optional[str] = None,
         task_device_classes: Optional[List[Optional[str]]] = None,
+        priority: int = 0,
     ) -> str:
         """Submit a bag. `device_class=None` (the default) means any node —
         that is the pre-existing behaviour and stays untouched.
@@ -162,15 +189,61 @@ class WorkQueue:
         ]
         with self.conn:
             self.conn.execute(
-                "INSERT INTO bags (bag_id, op, total, created_at, device_class) VALUES (?,?,?,?,?)",
-                (bag_id, op, len(params_list), now, device_class),
+                "INSERT INTO bags (bag_id, op, total, created_at, device_class, priority) VALUES (?,?,?,?,?,?)",
+                (bag_id, op, len(params_list), now, device_class, int(priority)),
             )
             self.conn.executemany(
                 "INSERT INTO tasks (bag_id, seq, idem_key, params_json, status, leased_to, lease_expires_at, attempts, result_key, device_class)"
                 " VALUES (?,?,?,?,?,?,?,?,?,?)",
                 rows,
             )
+        self.notify_work()
         return bag_id
+
+    # ------------------------------------------------------------------
+    # long-poll: pullers sleep until work may exist; waiters until results do
+    # ------------------------------------------------------------------
+
+    @property
+    def work_seq(self) -> int:
+        return self._work_seq
+
+    @property
+    def result_seq(self) -> int:
+        return self._result_seq
+
+    def notify_work(self) -> None:
+        with self._work_cv:
+            self._work_seq += 1
+            self._work_cv.notify_all()
+
+    def wait_for_work(self, seen_seq: int, timeout: float) -> None:
+        """Sleep until something new was queued after `seen_seq`, or timeout."""
+        with self._work_cv:
+            if self._work_seq == seen_seq and timeout > 0:
+                self._work_cv.wait(timeout)
+
+    def notify_results(self) -> None:
+        with self._result_cv:
+            self._result_seq += 1
+            self._result_cv.notify_all()
+
+    def wait_for_bag(self, bag_id: str, timeout: float) -> Optional[Dict[str, Any]]:
+        """Block until the bag closes or `timeout` passes; returns its status.
+        Wakes on every completion rather than polling the database."""
+        deadline = time.time() + max(0.0, timeout)
+        while True:
+            seen = self._result_seq
+            status = self.bag_status(bag_id)
+            if status is None or status.get("status") != "open":
+                return status
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return status
+            with self._result_cv:
+                if self._result_seq == seen:
+                    # Capped so an expired lease (requeue) is still noticed.
+                    self._result_cv.wait(min(remaining, 2.0))
 
     # ------------------------------------------------------------------
     # node capability index: which device classes a node can actually serve
@@ -223,6 +296,8 @@ class WorkQueue:
         for row in expired_nodes:
             self.note_failure(row["leased_to"])
         self.conn.commit()
+        if cur.rowcount:
+            self.notify_work()
         return cur.rowcount
 
     def _serve_set(
@@ -260,15 +335,24 @@ class WorkQueue:
         where, params = _class_filter(serves)
         try:
             self.conn.execute("BEGIN IMMEDIATE")
-            rows = self.conn.execute(
-                """SELECT t.bag_id AS bag_id, t.seq AS seq FROM tasks t
+            candidates = self.conn.execute(
+                """SELECT t.bag_id AS bag_id, t.seq AS seq, b.op AS op FROM tasks t
                    JOIN bags b ON b.bag_id = t.bag_id
                    WHERE t.status='queued' AND """
                 + where
                 + """
-                   ORDER BY t.bag_id, t.seq LIMIT ?""",
+                   ORDER BY COALESCE(b.priority, 0) DESC, b.created_at, t.bag_id, t.seq LIMIT ?""",
                 (*params, n_items),
             ).fetchall()
+            rows = []
+            if candidates:
+                # Interactive ops (OP_MAX_CHUNK) travel alone: one request per
+                # lease, so the next request is free to land on another node.
+                cap = OP_MAX_CHUNK.get(candidates[0]["op"])
+                if cap is not None:
+                    rows = [(c["bag_id"], c["seq"]) for c in candidates[:cap]]
+                else:
+                    rows = [(c["bag_id"], c["seq"]) for c in candidates if c["op"] not in OP_MAX_CHUNK]
             if rows:
                 claim = [(node_id, expires, now, bag, seq) for bag, seq in rows]
                 self.conn.executemany(
@@ -417,8 +501,14 @@ class WorkQueue:
     def complete(
         self, node_id: str, results: List[Dict[str, Any]], now: Optional[float] = None
     ) -> Dict[str, int]:
+        """Record results. `ok` defaults to True (older agents never sent it).
+
+        `ok=False` means the node ran the op and it raised. That is NOT a
+        result: the task goes back in the queue with the error remembered,
+        and only after MAX_TASK_ATTEMPTS does it close as failed, with the
+        error as its payload, so the failure is visible and never swallowed."""
         now = now if now is not None else time.time()
-        accepted = dupes = dropped = 0
+        accepted = dupes = dropped = requeued = failed = 0
         with self.conn:
             for item in results:
                 bag_id = item["bag_id"]
@@ -426,22 +516,45 @@ class WorkQueue:
                 idem_key = item["idem_key"]
                 payload_json = _json(item.get("payload"))
                 duration_s = float(item.get("duration_s") or 0.0)
-                rkey = new_result_key(payload_json)
+                ok = item.get("ok", True) is not False
                 task = self.conn.execute(
-                    "SELECT status, leased_to, idem_key FROM tasks WHERE bag_id=? AND seq=?",
+                    "SELECT status, leased_to, idem_key, attempts FROM tasks WHERE bag_id=? AND seq=?",
                     (bag_id, seq),
                 ).fetchone()
                 if task is None or task["idem_key"] != idem_key:
                     dropped += 1
                     continue
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO results (result_key, idem_key, bag_id, payload_json, node_id, duration_s, at)"
-                    " VALUES (?,?,?,?,?,?,?)",
-                    (rkey, idem_key, bag_id, payload_json, node_id, duration_s, now),
-                )
-                if task["status"] == "done":
+                rkey = new_result_key(payload_json)
+                if task["status"] in ("done", "failed"):
+                    if ok:
+                        self._store_result(rkey, idem_key, bag_id, payload_json, node_id, duration_s, now)
                     dupes += 1
                     continue
+                if not ok:
+                    attempts = int(task["attempts"] or 0) + 1
+                    error = _error_text(item.get("payload"))
+                    if attempts < MAX_TASK_ATTEMPTS:
+                        self.conn.execute(
+                            """UPDATE tasks SET status='queued', leased_to=NULL, lease_expires_at=NULL,
+                                 lease_started_at=NULL, attempts=?, last_error=?
+                               WHERE bag_id=? AND seq=?""",
+                            (attempts, error, bag_id, seq),
+                        )
+                        requeued += 1
+                        continue
+                    self._store_result(rkey, idem_key, bag_id, payload_json, node_id, duration_s, now)
+                    self.conn.execute(
+                        "UPDATE tasks SET status='failed', result_key=?, attempts=?, last_error=? WHERE bag_id=? AND seq=?",
+                        (rkey, attempts, error, bag_id, seq),
+                    )
+                    self.conn.execute(
+                        "UPDATE bags SET done = done + 1, failed = COALESCE(failed, 0) + 1,"
+                        " status = CASE WHEN done + 1 >= total THEN 'closed' ELSE status END WHERE bag_id=?",
+                        (bag_id,),
+                    )
+                    failed += 1
+                    continue
+                self._store_result(rkey, idem_key, bag_id, payload_json, node_id, duration_s, now)
                 self.conn.execute(
                     "UPDATE tasks SET status='done', result_key=? WHERE bag_id=? AND seq=?",
                     (rkey, bag_id, seq),
@@ -452,7 +565,33 @@ class WorkQueue:
                 )
                 accepted += 1
                 self._update_node_stats(node_id, duration_s)
-        return {"accepted": accepted, "duplicates": dupes, "dropped": dropped}
+        if requeued:
+            self.notify_work()
+        if accepted or failed or requeued:
+            self.notify_results()
+        return {
+            "accepted": accepted,
+            "duplicates": dupes,
+            "dropped": dropped,
+            "requeued": requeued,
+            "failed": failed,
+        }
+
+    def _store_result(
+        self,
+        rkey: str,
+        idem_key: str,
+        bag_id: str,
+        payload_json: str,
+        node_id: str,
+        duration_s: float,
+        now: float,
+    ) -> None:
+        self.conn.execute(
+            "INSERT OR IGNORE INTO results (result_key, idem_key, bag_id, payload_json, node_id, duration_s, at)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (rkey, idem_key, bag_id, payload_json, node_id, duration_s, now),
+        )
 
     @synchronized
     def renew(self, node_id: str, bag_id: str, seqs: List[int], lease_seconds: float) -> int:
@@ -510,7 +649,8 @@ class WorkQueue:
     @synchronized
     def bag_status(self, bag_id: str) -> Optional[Dict[str, Any]]:
         row = self.conn.execute(
-            "SELECT bag_id, op, total, done, created_at, status, device_class FROM bags WHERE bag_id=?",
+            "SELECT bag_id, op, total, done, created_at, status, device_class,"
+            " COALESCE(failed, 0) AS failed, COALESCE(priority, 0) AS priority FROM bags WHERE bag_id=?",
             (bag_id,),
         ).fetchone()
         if row is None:
@@ -571,9 +711,9 @@ class WorkQueue:
         rows = self.conn.execute(
             """SELECT t.idem_key AS idem_key, r.payload_json AS payload_json,
                       r.node_id AS node_id, t.seq AS seq, r.duration_s AS duration_s,
-                      r.result_key AS result_key
+                      r.result_key AS result_key, t.status AS status
                FROM tasks t JOIN results r ON r.result_key = t.result_key
-               WHERE t.bag_id=? AND t.status='done' ORDER BY t.seq""",
+               WHERE t.bag_id=? AND t.status IN ('done', 'failed') ORDER BY t.seq""",
             (bag_id,),
         ).fetchall()
         return [dict(r) for r in rows]
@@ -610,6 +750,14 @@ def _class_filter(
 
 def _node_can_serve(required: Optional[str], serves: Sequence[str]) -> bool:
     return not required or required in set(serves)
+
+
+def _error_text(payload: Any) -> str:
+    if isinstance(payload, dict):
+        for key in ("error", "reason"):
+            if payload.get(key):
+                return str(payload[key])[:500]
+    return str(payload)[:500]
 
 
 def _json(obj: Any) -> str:

@@ -51,7 +51,7 @@ def test_registration_rejected_without_token_when_required():
             urllib.request.urlopen(req, timeout=5)
             raise AssertionError("registration should have been rejected")
         except urllib.error.HTTPError as e:
-            assert e.code == 400
+            assert e.code == 403  # forbidden: no consent credential presented
 
         token = hub.enrollment.create()["token"]
         payload["token"] = token

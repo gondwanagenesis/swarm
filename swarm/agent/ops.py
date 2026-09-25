@@ -365,6 +365,76 @@ def op_embed(params: Dict[str, Any]) -> Any:
     return out
 
 
+_CHAT_OPTIONS = (
+    "temperature", "top_p", "max_tokens", "max_completion_tokens", "stop", "seed",
+    "presence_penalty", "frequency_penalty", "response_format", "tools", "tool_choice",
+)
+
+
+def chat_runtime_models(timeout: float = 2.0) -> Optional[List[str]]:
+    """Chat-capable models the local Ollama reports, or None if no Ollama."""
+    try:
+        with urllib.request.urlopen(_ollama_url() + "/api/tags", timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+    return sorted(
+        m.get("name")
+        for m in (data.get("models") or [])
+        if "completion" in (m.get("capabilities") or [])
+    )
+
+
+def op_chat(params: Dict[str, Any]) -> Any:
+    """One chat completion on this node's local runtime (Ollama today).
+
+    Real inference, routed here because this node reported holding the model
+    (``model:<name>`` class). Fails CLOSED: no runtime, or a model this node
+    does not have, raises — a made-up reply is the lie this system exists to
+    not tell. The response is the runtime's own OpenAI-shaped completion,
+    plus attribution fields saying who produced it.
+
+    Params: model, messages (required); temperature, top_p, max_tokens, stop,
+    seed, ... passed through; request_id is ignored (it only exists to keep
+    identical prompts from sharing one content-addressed result).
+    """
+    model = params.get("model")
+    messages = params.get("messages")
+    if not isinstance(model, str) or not model:
+        raise ValueError("chat requires 'model'")
+    if not isinstance(messages, list) or not messages:
+        raise ValueError("chat requires a non-empty 'messages' list")
+    models = chat_runtime_models()
+    if models is None:
+        raise RuntimeError("no local chat runtime on this node (looked for Ollama at {})".format(_ollama_url()))
+    if model not in models:
+        raise RuntimeError("model {!r} not present here; this node has {}".format(model, models))
+    body: Dict[str, Any] = {"model": model, "messages": messages, "stream": False}
+    for key in _CHAT_OPTIONS:
+        if key in params:
+            body[key] = params[key]
+    req = urllib.request.Request(
+        _ollama_url() + "/v1/chat/completions",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    started = time.perf_counter()
+    with urllib.request.urlopen(req, timeout=float(params.get("timeout", 600.0))) as resp:
+        completion = json.loads(resp.read().decode("utf-8"))
+    elapsed = time.perf_counter() - started
+    if not isinstance(completion, dict) or not completion.get("choices"):
+        raise RuntimeError("chat runtime returned no choices")
+    return {
+        "op": "chat",
+        "model": model,
+        "response": completion,
+        "tier": "ollama_local",
+        "device": "runtime:ollama",
+        "backend": "ollama",
+        "elapsed_s": round(elapsed, 4),
+    }
+
+
 def op_matmul(params: Dict[str, Any]) -> Any:
     """Dense integer matmul, C = A @ B. Pure function of its params.
 
@@ -476,4 +546,5 @@ OPS: Dict[str, Callable[[Dict[str, Any]], Any]] = {
     "hashwork": op_hashwork,
     "matmul": op_matmul,
     "embed": op_embed,
+    "chat": op_chat,
 }

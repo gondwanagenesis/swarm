@@ -37,33 +37,53 @@ def build_agent_pyz(output: Union[str, Path, None] = None, source_root: Optional
             (p for p in Path(__file__).resolve().parents if (p / "swarm" / "core").is_dir()),
             Path(__file__).resolve().parents[2],
         )
-    buf = io.BytesIO()
-    files: List[str] = []
-    files.append("__main__.py")
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-        zf.writestr("__main__.py", _MAIN)
-        pkg_root = root / "swarm"
-        init_file = pkg_root / "__init__.py"
-        if init_file.exists():
-            zf.write(init_file, "swarm/__init__.py")
-        for pkg in _BUNDLE_PACKAGES:
-            pkg_dir = pkg_root / pkg
-            if not pkg_dir.is_dir():
-                continue
-            for py_file in sorted(pkg_dir.rglob("*.py")):
-                if "__pycache__" in py_file.parts:
-                    continue
-                arcname = "swarm/" + "/".join(py_file.relative_to(pkg_root).parts)
-                zf.write(py_file, arcname)
-                files.append(arcname)
-        if config:
-            import json as _json
+    import hashlib
+    import json as _json
 
+    pkg_root = root / "swarm"
+    sources: List[tuple] = [("__main__.py", _MAIN.encode("utf-8"))]
+    init_file = pkg_root / "__init__.py"
+    if init_file.exists():
+        sources.append(("swarm/__init__.py", init_file.read_bytes()))
+    for pkg in _BUNDLE_PACKAGES:
+        pkg_dir = pkg_root / pkg
+        if not pkg_dir.is_dir():
+            continue
+        for py_file in sorted(pkg_dir.rglob("*.py")):
+            if "__pycache__" in py_file.parts:
+                continue
+            arcname = "swarm/" + "/".join(py_file.relative_to(pkg_root).parts)
+            sources.append((arcname, py_file.read_bytes()))
+    # The CODE identity, independent of zip timestamps and of any per-invite
+    # config: two bundles with the same code hash run the same agent. The
+    # self-updater compares this, never the file hash (a per-invite bundle
+    # always differs from the generic one byte-wise).
+    digest = hashlib.sha256()
+    for arcname, data in sources:
+        digest.update(arcname.encode("utf-8") + b"\0" + data + b"\0")
+    code_hash = digest.hexdigest()
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+        for arcname, data in sources:
+            zf.writestr(arcname, data)
+        zf.writestr("swarm_build.json", _json.dumps({"code_hash": code_hash}, sort_keys=True))
+        if config:
             zf.writestr("swarm_config.json", _json.dumps(config, sort_keys=True))
     payload = buf.getvalue()
     if output:
         Path(output).write_bytes(payload)
     return payload
+
+
+def bundle_code_hash(payload: bytes) -> Optional[str]:
+    """The code hash baked into a bundle, or None for pre-hash bundles."""
+    import json as _json
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+            return str(_json.loads(zf.read("swarm_build.json").decode("utf-8"))["code_hash"])
+    except Exception:
+        return None
 
 
 def main() -> int:

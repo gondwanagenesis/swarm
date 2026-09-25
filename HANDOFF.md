@@ -70,6 +70,15 @@ verdicts. That loop *is* the organism breathing.
 | `/api/self-update`, `/api/bundle/latest` | POST/GET | node self-update channel (hash-verified) |
 | `/api/backup` | GET | consistent sqlite snapshot w/ SHA-256 header |
 | `/api/pipeline/plan` | POST | M5 measured-memory stage mapping (scaffold) |
+| `/v1/models`, `/v1/chat/completions`, `/v1/embeddings` | GET/POST | OpenAI-compatible front door (owner key = API key) |
+| `/api/models`, `/api/models/plan`, `/api/models/deploy`, `/api/models/undeploy` | GET/POST | catalog, placement preview, start/stop serving |
+| `/api/services/sync` | POST | node reports actual services, long-polls for desired ones |
+| `/api/services` | GET | desired services fleet-wide |
+| `/api/tasks/renew` | POST | lease renewal (was missing — agents got 404) |
+| `/api/bag/<id>/results` | GET | results in task order, failures marked |
+| `/api/tokens` | POST | mint an invite token |
+| `/api/nodes/revoke` | POST | revoke a node's key |
+| `/join`, `/join.sh`, `/join.ps1`, `/join/seed-kit.zip` | GET | add-a-device page (owner) + token-gated joiners and kit |
 | `/api/anomalies`, `/api/sharpen` | GET/POST | honest gaps + idle-hone ingestion |
 | `/` | GET | dashboard (renders trust tiers, never plausibilities) |
 
@@ -147,6 +156,41 @@ never executed — this machine has an Intel Iris Xe with `runtimes=[]` and
 `torch 2.13.0+cpu`. Adapter synthesis has never run against a live LLM. M5
 still does not execute a model. Do not mark any of these done without a run.
 
+## The usable-fabric pass (2026-09-26) — what changed and why
+
+Goal from the owner: *plug it in, click accept, and everything else handles
+itself.* Tracker: [`REQUIREMENTS.md`](REQUIREMENTS.md) — read it before
+planning; it says what is proven, built, missing, and OS-impossible.
+
+New organs:
+
+| Organ | Module | Job |
+|---|---|---|
+| Membrane | `hub/auth.py` | owner key, per-node keys; off-loopback = secure by default |
+| Runtime senses | `probe/runtimes.py` | Ollama models, llama.cpp binaries + build + device free memory, GGUF headers |
+| Services | `agent/services.py` | reconcile hub-desired `rpc-server`/`llama-server`; validated specs, agent-built argv, log scan for dropped helpers |
+| Model placement | `hub/inference.py` | catalog, `plan_llama` (single if it fits; else fewest nodes, same build), deployments state machine |
+| Front door | `hub/gateway.py` | OpenAI `/v1`; GGUF → proxy to head (streaming); Ollama → priority 1-task bag |
+| Joining | `hub/join.py`, `agent/join_scripts.py` | `/join` page, joiners per OS, seed kit, pinned fleet llama.cpp tag |
+| Owner CLI | `swarm/cli.py` | status / models / chat / deploy / plan / map / join |
+
+Bugs found and fixed (each pinned by a test): results with `ok=False` were
+stored as finished; `/api/tasks/renew` did not exist; `/invite` minted tokens
+for anyone; `runtime:*` routing never fired (`NodeProfile` has no
+`runtimes`); bundles baked `http://0.0.0.0`; self-update compared file hashes
+and would strip a node's config; closing sqlite under a long-poll thread was
+an access violation; idle hone ran a CPU benchmark every ~2 s.
+
+Live topology (Diego's fleet):
+
+- **Hub:** VPS, `systemctl status swarm-hub`, code in `/root/swarm-hub`,
+  bound to `100.81.227.46:8777` (Tailscale only), db + owner key in
+  `/root/.swarm/`. Redeploy = copy `swarm/` there + `systemctl restart
+  swarm-hub`; joined nodes self-update within a minute.
+- **Owner key on the laptop:** `~/.swarm/hub-vps.owner.key` (use
+  `SWARM_OWNER_KEY=$(cat …)`; never print it).
+- **Fleet llama.cpp tag:** pinned in the hub db (`hub_settings.llama_tag`).
+
 ## Hard-hat areas (rough drafts — honest labels)
 
 - `swarm/hub/pipeline.py` — M5 *scaffold*. Stage→node mapping on measured free
@@ -161,7 +205,9 @@ still does not execute a model. Do not mark any of these done without a run.
 ## Roadmap (sacred order, kept current in AGENTS.md)
 
 - M1, M2, M3, M4, M4.5, M5-scaffold, plus workshop + brain router: **done**
-- M5-real: pipeline-parallel behavioral runs on gated adapters
+- M5 executes real models (llama.cpp RPC), M5.5 zero-touch joining: **done** (see REQUIREMENTS.md)
+- Next (REQUIREMENTS D12–D13, B8, C5): brain→worker tools (MCP `swarm_run_python`/`swarm_map`),
+  cloud fallback in `/v1`, code-worker opt-in, placement learning from measured tokens/s
 - M6: multi-model packing, adaptive replication, fine-tuning small models on
   fleet observations
 - Later-honors: exemplar similarity index (nearest-neighbor adapter lookup),
@@ -188,6 +234,29 @@ still does not execute a model. Do not mark any of these done without a run.
    `ignore_welfare=True` explicitly and loudly.
 10. **Agent zipapps on Windows** replace fine via `os.replace` + `os.execv`;
     dev checkouts never self-update (`not-bundled`).
+
+### Footguns found 2026-09-26
+
+11. **llama.cpp RPC needs matching builds.** A head facing a different
+    protocol logs `RPC server version mismatch` and *carries on alone* —
+    healthy-looking, wrong. The hub pins one build; the planner skips
+    mismatched helpers; the agent fails a head whose log shows a dropped helper.
+12. **winget's llama.cpp lags the releases** by weeks. Joiners install the
+    pinned release into `~/.swarm/llama`; the agent searches there first.
+13. **A Vulkan loader is not a GPU.** Headless Linux ships mesa llvmpipe;
+    joiners require `/dev/dri/renderD*` before choosing a Vulkan build.
+14. **Windows Defender scans a fresh .exe on first run** — `--version` took
+    >15 s once. Version probe timeout is 30 s.
+15. **Thinking models return empty `content`** when the budget runs out in
+    `reasoning_content`. The CLI sends `chat_template_kwargs.enable_thinking=false`
+    unless `--think`.
+16. **`pgrep -f` over ssh matches its own command line.** Use `ps -C`.
+17. **Never `rm -rf ~/.swarm` to uninstall an agent** — a hub on the same box
+    keeps its db and owner key there. Joiners remove agent files only.
+18. **Pooling over the internet is physics-bound.** Laptop↔VPS measured
+    324 ms RTT and ~1.2–1.5 MB/s: first load of a split model takes many
+    minutes (then `rpc-server --cache` makes reloads fast), and every token
+    pays the round trip. The planner never splits a model that fits.
 
 ## Contribution rules (short)
 

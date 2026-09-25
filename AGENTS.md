@@ -54,6 +54,14 @@ plausible-looking lie. Anomalies are recorded, never suppressed.
   `TrustTier.ESTIMATED` or below.
 - No self-propagation: the agent is installed by the machine's owner through an
   authorized channel. The system never copies itself onto a machine it found.
+  A joiner the owner runs may install prerequisites (Python, the fleet's
+  llama.cpp build) — it lists them before doing anything; the running agent
+  itself still installs nothing.
+- A hub reachable off-box is secure by default (`hub/auth.py`): owner key for
+  anything that runs code or reads the fleet, per-node keys for the work loop.
+  `--open` exists for a lab bench and says so loudly.
+- A remote party never names a binary or path on a node: services are built
+  agent-side from validated specs, against runtimes the node discovered.
 
 ## The capability tower convention
 
@@ -104,11 +112,18 @@ The organism heals itself the way it earns trust: by proof, not permission.
   retrievable (a gate pass that discards the code proves nothing); the gate is
   contract-driven and subprocess-isolated; `device_class` routing from measured
   profiles; LAN discovery wired so `--hub` is optional. See HANDOFF.md.
-- **M5 (planner done, execution absent):** exact DP contiguous-chain min-max
-  partition over measured free memory, reporting bottleneck and latency
-  separately, failing closed. It does **not** execute a model — no weights, no
-  tensor transport. Behavioral runs on gated adapters land next.
+- **M5 (done — executes real models):** the scaffold's honesty (measured
+  memory only, fail closed, never shard what fits) now drives llama.cpp's
+  RPC backend: `hub/inference.py` plans, agents reconcile declarative
+  services (`agent/services.py`), the OpenAI gateway (`hub/gateway.py`)
+  proxies. Pooling uses fewest-nodes placement (single-stream decode crosses
+  every hop, so hops cost more than the slowest stage). Proven live laptop
+  GPU + VPS CPU; numbers in REQUIREMENTS.md.
+- **M5.5 (done):** zero-touch joining — one-line joiners per platform, seed
+  kits, pinned fleet llama.cpp build, self-update by code hash, secure-by-
+  default hubs (owner key, node keys, tokens).
 - **M6:** multi-model packing, small-model fine-tuning, adaptive replication.
 
 Do not build M4 features while M2/M3 invariants are untested.
-Do not build M6 features while M5's planner hasn't executed a real model.
+M5 has executed a real model; M6 is unblocked. The live requirement
+tracker is REQUIREMENTS.md — update it in the same PR as the work.

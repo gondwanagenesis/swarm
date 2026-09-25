@@ -72,19 +72,29 @@ def battery_state() -> Dict[str, Any]:
     return state
 
 
-def welfare_gate() -> Dict[str, Any]:
+def welfare_gate(dedicated: bool = False) -> Dict[str, Any]:
     """Returns {allowed: bool, reason: str, details: {...}}. Fail-open means
-    no — the organism works when IT CAN PROVE the host is idle and fed."""
+    no — the organism works when IT CAN PROVE the host is idle and fed.
+
+    `dedicated` is the owner saying "this machine exists to compute" (an old
+    phone on a charger, a GPU box in a closet): someone touching it does not
+    park the work. Battery protection still applies — a dedicated phone is
+    not allowed to drain itself flat."""
     bat = battery_state()
     idle_s = user_idle_seconds()
-    details: Dict[str, Any] = {"battery": bat, "user_idle_s": idle_s, "platform": platform.system()}
+    details: Dict[str, Any] = {
+        "battery": bat,
+        "user_idle_s": idle_s,
+        "platform": platform.system(),
+        "dedicated": dedicated,
+    }
 
     if bat.get("on_ac") is False:
         pct = bat.get("battery_percent")
         if pct is not None and pct < BATTERY_MIN_PERCENT:
             return {"allowed": False, "reason": f"battery at {pct}% — organism rests", "details": details}
 
-    if idle_s is not None and idle_s < USER_IDLE_REQUIRE_S:
+    if not dedicated and idle_s is not None and idle_s < USER_IDLE_REQUIRE_S:
         return {"allowed": False, "reason": f"user active {idle_s:.0f}s ago", "details": details}
 
     return {"allowed": True, "reason": "host idle and fed", "details": details}
