@@ -137,7 +137,11 @@ class Registry:
             self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
 
     def close(self) -> None:
-        self._conn.close()
+        # Under the shared lock: closing while a handler thread is mid-query
+        # is an access violation in sqlite, not a Python exception. Callers
+        # arriving after this get a clean ProgrammingError instead.
+        with self._lock:
+            self._conn.close()
 
     @synchronized
     def upsert_node(

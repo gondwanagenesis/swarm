@@ -10,6 +10,12 @@ GET  /api/nodes/<id> full stored profile
 GET  /api/links      link matrix
 GET  /api/anomalies  recent anomalies
 GET  /               dashboard
+GET  /v1/models, POST /v1/chat/completions, POST /v1/embeddings
+                     OpenAI-compatible gateway onto the fleet (gateway.py)
+
+Access (auth.py): a loopback-only hub is open; any other bind is secure by
+default — owner key for owner routes, per-node keys for the work loop,
+enrollment tokens for joining. The route tables below are the whole policy.
 """
 
 from __future__ import annotations
@@ -26,13 +32,41 @@ from ..core.identity import canonical_hash
 from ..core.models import BenchResult, LinkMeasurement, NodeProfile
 from ..core.serde import from_dict
 from ..integrator.llm import from_env as llm_from_env
+from .auth import HubAuth, is_loopback, load_or_create_owner_key
 from .dashboard import render_dashboard
 from .enrollment import Enrollment
+from .gateway import Gateway, GatewayError, openai_error
+from .holo import Holo
+from .inference import Inference
 from .queue import WorkQueue
 from .registry import Registry
 from .scheduler import ChunkPlanner
 
 MAX_BODY = 64 * 1024 * 1024
+MAX_ECHO = 8 * 1024 * 1024
+LONG_POLL_MAX_S = 25.0
+
+# Who may call what (auth.py). Anything not listed here is an OWNER route.
+PUBLIC_GET = frozenset({"/api/ping"})
+# Routes that check their own credential (node key, invite token, owner key,
+# or a peer-hub signature) and answer a plain 404 to everyone else.
+SELF_GATED_GET = frozenset({"/agent.pyz", "/api/bundle/latest", "/api/hubinfo", "/worker", "/api/me"})
+# Token-gated GETs validate the enrollment token themselves.
+TOKEN_GET = frozenset({"/bundle.pyz", "/join.sh", "/join.ps1", "/join/seed-kit.zip", "/api/replica"})
+PUBLIC_POST = frozenset({"/api/echo", "/api/register"})
+NODE_POST = frozenset(
+    {
+        "/api/heartbeat",
+        "/api/link",
+        "/api/tasks/pull",
+        "/api/tasks/complete",
+        "/api/tasks/renew",
+        "/api/sharpen",
+        "/api/self-update",
+        "/api/services/sync",
+        "/api/spore/event",
+    }
+)
 
 
 def _swarm_version() -> str:
@@ -50,14 +84,42 @@ class Hub:
         host: str = "127.0.0.1",
         port: int = 8777,
         db_path: str = ":memory:",
-        require_token: bool = False,
+        require_token: Optional[bool] = None,
+        secure: Optional[bool] = None,
+        owner_key: Optional[str] = None,
     ) -> None:
         self.host = host
         self.port = port
-        self.require_token = require_token
+        # Secure unless nothing off-box can reach us. Explicit args win.
+        self.secure = (not is_loopback(host)) if secure is None else bool(secure)
+        self.require_token = self.secure if require_token is None else bool(require_token)
         self.registry = Registry(db_path)
         self.queue = WorkQueue(self.registry._conn, lock=self.registry._lock)
         self.enrollment = Enrollment(self.registry._conn, lock=self.registry._lock)
+        self.holo = Holo(self)
+        stored_hash = self.holo.settings.get("owner_key_hash")
+        if self.secure and owner_key is None:
+            key_path = (
+                Path(db_path).parent / "owner.key"
+                if db_path != ":memory:"
+                else Path.home() / ".swarm" / "owner.key"
+            )
+            import os as _os
+
+            if _os.environ.get("SWARM_OWNER_KEY") or key_path.exists() or not stored_hash:
+                owner_key = load_or_create_owner_key(key_path)
+            # else: a hub restored from a replica — verify against the hash only.
+        self.auth = HubAuth(
+            self.registry._conn,
+            lock=self.registry._lock,
+            secure=self.secure,
+            owner_key=owner_key,
+            owner_key_hash=stored_hash if owner_key is None else None,
+        )
+        if self.auth.owner_key_hash and self.auth.owner_key_hash != stored_hash:
+            self.holo.settings.set("owner_key_hash", self.auth.owner_key_hash)
+        self.inference = Inference(self.registry._conn, self.registry._lock, self.registry, hub=self)
+        self.gateway = Gateway(self)
         self.planner = ChunkPlanner(self.registry)
         self.llm_config = llm_from_env()
         from ..integrator.policy import BrainRouter, local_brain_config_from_env
@@ -78,6 +140,7 @@ class Hub:
             lock=self.registry._lock,
             autopilot=autopilot_env not in ("0", "false", "no"),
         )
+        self._stopping = False
         self.agent_payload: Optional[bytes] = None
         self.latest_bundle_hash: Optional[str] = None
         self.started_at = time.time()
@@ -150,14 +213,19 @@ class Hub:
     def set_agent_payload(self, payload: bytes) -> None:
         import hashlib
 
+        from .agentbundle import bundle_code_hash
+
         self.agent_payload = payload
         self.latest_bundle_hash = hashlib.sha256(payload).hexdigest()
+        self.latest_code_hash = bundle_code_hash(payload)
 
     def make_handler(self) -> type:
         hub = self
 
         class Handler(BaseHTTPRequestHandler):
-            server_version = "SwarmHub/0.1"
+            # Low profile: nothing in the headers says what this is.
+            server_version = "httpd"
+            sys_version = ""
 
             def log_message(self, format: str, *args: Any) -> None:
                 return
@@ -196,9 +264,143 @@ class Hub:
             def _bad(self, msg: str) -> None:
                 self._send_json({"ok": False, "error": msg}, status=400)
 
+            def _query(self) -> Dict[str, Any]:
+                from urllib.parse import parse_qs, urlparse
+
+                return {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items() if v}
+
+            def _owner(self) -> bool:
+                return hub.auth.is_owner(self.headers, self._query())
+
+            def _not_found(self) -> None:
+                body = b"Not Found"
+                self.send_response(404)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _deny(self, path: str) -> None:
+                if hub.secure:
+                    # Dark to strangers (lowprofile.py): API clients get a bare
+                    # 401 so a wrong key is diagnosable; everything else, 404.
+                    if path.startswith("/v1/"):
+                        self._send_json(openai_error("invalid API key", "unauthorized", 401), status=401)
+                    else:
+                        self._not_found()
+                    return
+                if path.startswith("/v1/"):
+                    self._send_json(
+                        openai_error("missing or wrong API key (use the hub owner key)", "unauthorized", 401),
+                        status=401,
+                    )
+                elif path in ("/", "/index.html"):
+                    self._send_html(hub._locked_page(), status=401)
+                else:
+                    self._send_json({"ok": False, "error": "unauthorized"}, status=401)
+
+            def _node(self, payload: Dict[str, Any]) -> Optional[str]:
+                """Authenticated node id for a work-loop call, or None (401 sent)."""
+                claimed = str(payload.get("node_id") or "") or None
+                node_id = hub.auth.is_node(self.headers, claimed)
+                if node_id is None:
+                    body = {"ok": False} if hub.secure else {"ok": False, "error": "unknown node or bad node key; re-enroll"}
+                    self._send_json(body, status=401)
+                return node_id
+
+            def _peer(self) -> bool:
+                from .lowprofile import peer_ok
+
+                return peer_ok(self.headers, hub.auth.owner_key_hash)
+
+            def _token_ok(self) -> bool:
+                token = str(self._query().get("token") or self.headers.get("X-Swarm-Token") or "")
+                return bool(token) and hub.enrollment.validate(token) is not None
+
+            def _public_base(self) -> str:
+                """The URL this client used to reach us — what a bundle or a
+                join script must bake in (never 0.0.0.0)."""
+                host = self.headers.get("Host") or f"{hub.host}:{hub.port}"
+                return f"http://{host}"
+
             def do_GET(self) -> None:
                 try:
                     path = self.path.split("?", 1)[0]
+                    if hub.holo.demoted and path not in ("/api/ping", "/api/hubinfo"):
+                        self._send_json({"ok": False, **hub.holo.demoted, "error": "this hub stepped aside"}, status=409)
+                        return
+                    gated = (
+                        path not in PUBLIC_GET
+                        and path not in TOKEN_GET
+                        and path not in SELF_GATED_GET
+                        and not path.startswith("/invite")
+                    )
+                    if gated and not self._owner():
+                        self._deny(path)
+                        return
+                    if path in SELF_GATED_GET and hub.secure:
+                        allowed = self._owner() or hub.auth.is_node(self.headers, None) is not None
+                        if path == "/api/hubinfo":
+                            # a node that joined seconds before the old hub died
+                            # may be missing from the replica: its invite (which
+                            # IS in the replica) still proves membership
+                            allowed = allowed or self._peer() or self._token_ok()
+                        if path in ("/agent.pyz", "/worker"):
+                            allowed = allowed or self._token_ok()
+                        if not allowed:
+                            self._not_found()
+                            return
+                    if path == "/api/me":
+                        node_id = hub.auth.is_node(self.headers, None)
+                        if node_id is None or node_id == "local":
+                            node_id = str(self._query().get("node_id") or "")
+                        self._send_json(hub.node_summary(node_id))
+                        return
+                    if path == "/api/hubinfo":
+                        # nodes in failover and peer hubs deciding whether to
+                        # step aside ask this; strangers got a 404 above
+                        info = hub.holo.info()
+                        self._send_json(
+                            {
+                                "ok": True,
+                                "swarm_id": info["swarm_id"],
+                                "epoch": info["epoch"],
+                                "rank": info["rank"],
+                                "demoted": info["demoted"],
+                            }
+                        )
+                        return
+                    if path == "/api/replica":
+                        node_id = hub.auth.is_node(self.headers, None)
+                        if node_id is None and not self._owner():
+                            self._send_json({"ok": False, "error": "unauthorized"}, status=401)
+                            return
+                        rep = hub.holo.replica()
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/gzip")
+                        self.send_header("X-Replica-SHA256", rep["sha256"])
+                        self.send_header("X-Epoch", str(rep["epoch"]))
+                        self.send_header("X-Swarm-Id", hub.holo.swarm_id)
+                        self.send_header("Content-Length", str(len(rep["bytes"])))
+                        self.end_headers()
+                        self.wfile.write(rep["bytes"])
+                        return
+                    if path == "/worker":
+                        from .browser_worker import worker_page
+
+                        self._send_html(worker_page())
+                        return
+                    if path in ("/", "/index.html") and hub.secure and self._query().get("key"):
+                        # One ?key= visit sets a cookie so the key leaves the URL.
+                        self.send_response(303)
+                        self.send_header("Location", "/")
+                        self.send_header(
+                            "Set-Cookie",
+                            f"swarm_key={self._query()['key']}; HttpOnly; SameSite=Strict; Path=/",
+                        )
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
                     if path == "/api/ping":
                         self._send_json({"ok": True, "ts": time.time()})
                     elif path == "/api/bundle/latest":
@@ -221,13 +423,10 @@ class Hub:
                             }
                         )
                     elif path == "/agent.pyz":
-                        if hub.agent_payload is None:
-                            self._send_json(
-                                {"ok": False, "error": "agent bundle not built on this hub"},
-                                status=404,
-                            )
+                        body = hub.bundle_for(None)  # builds it on first use
+                        if not body:
+                            self._not_found()
                         else:
-                            body = hub.agent_payload
                             self.send_response(200)
                             self.send_header("Content-Type", "application/octet-stream")
                             self.send_header("Content-Disposition", "attachment; filename=swarm-agent.pyz")
@@ -270,6 +469,11 @@ class Hub:
                     elif path == "/invite" or path.startswith("/invite/"):
                         token = path.rsplit("/", 1)[-1] if path != "/invite" else ""
                         if not token or hub.enrollment.validate(token) is None:
+                            if hub.secure and not self._owner():
+                                # A stranger with no valid invite gets no token:
+                                # minting one here would make enrollment a formality.
+                                self._not_found()
+                                return
                             minted = hub.enrollment.create(role="node", label="invite-page")
                             token = minted["token"]
                         self._send_html(hub._invite_page(token))
@@ -279,13 +483,12 @@ class Hub:
                         q = parse_qs(urlparse(self.path).query)
                         token = (q.get("token") or [""])[0]
                         if hub.enrollment.validate(token) is None:
-                            self._send_json({"ok": False, "error": "invalid or expired token"}, status=403)
+                            if hub.secure:
+                                self._not_found()
+                            else:
+                                self._send_json({"ok": False, "error": "invalid or expired token"}, status=403)
                             return
-                        from .agentbundle import build_agent_pyz
-
-                        bundle = build_agent_pyz(
-                            config={"hub": f"http://{hub.host}:{hub.port}", "token": token}
-                        )
+                        bundle = hub.bundle_for(hub.bundle_config(self._public_base(), token))
                         self.send_response(200)
                         self.send_header("Content-Type", "application/octet-stream")
                         self.send_header("Content-Disposition", "attachment; filename=swarm-agent.pyz")
@@ -315,6 +518,53 @@ class Hub:
                         self._send_json(hub.brain_status())
                     elif path == "/api/bags":
                         self._send_json({"bags": hub.queue.open_bags()})
+                    elif path.startswith("/api/bag/") and path.endswith("/results"):
+                        bag_id = path[len("/api/bag/") : -len("/results")]
+                        status = hub.queue.bag_status(bag_id)
+                        if status is None:
+                            self._send_json({"ok": False, "error": "unknown bag"}, status=404)
+                        else:
+                            rows = hub.queue.results_for_bag(bag_id)
+                            self._send_json(
+                                {
+                                    **status,
+                                    "results": [
+                                        {
+                                            "seq": r["seq"],
+                                            "ok": r.get("status") != "failed",
+                                            "node_id": r["node_id"],
+                                            "duration_s": r["duration_s"],
+                                            "payload": json.loads(r["payload_json"]),
+                                        }
+                                        for r in rows
+                                    ],
+                                }
+                            )
+                    elif path == "/v1/models":
+                        self._send_json(hub.gateway.models())
+                    elif path == "/api/models":
+                        hub.inference.tick()
+                        self._send_json(
+                            {
+                                "catalog": hub.inference.catalog(),
+                                "deployments": hub.inference.list_deployments(),
+                            }
+                        )
+                    elif path == "/api/models/plan":
+                        q = self._query()
+                        self._send_json(
+                            hub.inference.plan(
+                                str(q.get("model") or ""),
+                                force_shard=q.get("force_shard") in ("1", "true", "yes"),
+                                ctx=int(q.get("ctx") or 4096),
+                            )
+                        )
+                    elif path == "/api/services":
+                        self._send_json({"services": hub.inference.list_services()})
+                    elif path in ("/join", "/join.sh", "/join.ps1", "/join/seed-kit.zip"):
+                        from .join import handle_join
+
+                        handle_join(hub, self, path)
                     elif path.startswith("/api/bag/"):
                         bag_id = path.rsplit("/", 1)[-1]
                         status = hub.queue.bag_status(bag_id)
@@ -323,7 +573,8 @@ class Hub:
                         else:
                             self._send_json(status)
                     elif path in ("/", "/index.html"):
-                        self._send_html(render_dashboard(hub.registry, hub.queue))
+                        hub.inference.tick()
+                        self._send_html(render_dashboard(hub.registry, hub.queue, hub.inference))
                     else:
                         self._send_json({"ok": False, "error": "not found"}, status=404)
                 except BrokenPipeError:
@@ -332,10 +583,45 @@ class Hub:
                     with contextlib.suppress(Exception):
                         self._send_json({"ok": False, "error": str(exc)}, status=500)
 
+            def _handle_v1(self, path: str) -> None:
+                try:
+                    body = self._read_json()
+                    if path == "/v1/chat/completions":
+                        hub.gateway.chat(body, self)
+                    elif path == "/v1/embeddings":
+                        self._send_json(hub.gateway.embeddings(body))
+                    else:
+                        self._send_json(openai_error(f"unknown route {path}", "not_found", 404), status=404)
+                except GatewayError as exc:
+                    self._send_json(exc.body, status=exc.status)
+                except (ValueError, json.JSONDecodeError) as exc:
+                    self._send_json(openai_error(str(exc), "invalid_request", 400), status=400)
+
             def do_POST(self) -> None:
                 try:
                     path = self.path.split("?", 1)[0]
+                    if hub.holo.demoted:
+                        with contextlib.suppress(Exception):
+                            length = int(self.headers.get("Content-Length") or 0)
+                            if 0 < length <= 1024 * 1024:
+                                self.rfile.read(length)
+                        self._send_json({"ok": False, **hub.holo.demoted, "error": "this hub stepped aside"}, status=409)
+                        return
+                    if path not in PUBLIC_POST and path not in NODE_POST and not self._owner():
+                        # Drain a modest body first: replying over unread bytes
+                        # makes Windows reset the socket instead of delivering 401.
+                        with contextlib.suppress(Exception):
+                            length = int(self.headers.get("Content-Length") or 0)
+                            if 0 < length <= 1024 * 1024:
+                                self.rfile.read(length)
+                        self._deny(path)
+                        return
+                    if path.startswith("/v1/"):
+                        self._handle_v1(path)
+                        return
                     if path == "/api/echo":
+                        if int(self.headers.get("Content-Length") or 0) > MAX_ECHO:
+                            raise ValueError("echo payload too large")
                         body = self._read_body()
                         self.send_response(200)
                         self.send_header("Content-Type", "application/octet-stream")
@@ -344,14 +630,45 @@ class Hub:
                         self.wfile.write(body)
                     elif path == "/api/register":
                         payload = self._read_json()
-                        node_id = hub.handle_register(payload)
-                        self._send_json({"ok": True, "node_id": node_id})
+                        claimed = str(((payload.get("profile") or {}).get("node_id")) or "")
+                        presented = self.headers.get("X-Swarm-Node-Key")
+                        rejoining = bool(claimed) and hub.auth.node_key_valid(claimed, presented)
+                        if hub.require_token and not rejoining and not (hub.secure and self._owner()):
+                            token = str(payload.get("token") or "")
+                            if hub.enrollment.validate(token, consume=True) is None:
+                                if hub.secure:
+                                    self._not_found()  # dark: no hint that this is a join endpoint
+                                else:
+                                    self._send_json(
+                                        {"ok": False, "error": "missing or invalid enrollment token"}, status=403
+                                    )
+                                return
+                        node_id = hub.handle_register(payload, client_host=self.client_address[0])
+                        out: Dict[str, Any] = {"ok": True, "node_id": node_id}
+                        if hub.secure and not rejoining:
+                            out["node_key"] = hub.auth.issue_node_key(node_id)
+                            hub.holo.mark_dirty()  # successors must learn this key soon
+                        self._send_json(out)
                     elif path == "/api/heartbeat":
                         payload = self._read_json()
+                        node_id = self._node(payload)
+                        if node_id is None:
+                            return
                         known = hub.registry.heartbeat(str(payload.get("node_id", "")))
-                        self._send_json({"ok": known})
+                        out = {"ok": known}
+                        if known:
+                            info = hub.holo.info()
+                            out["holo"] = {
+                                "swarm_id": info["swarm_id"],
+                                "epoch": info["epoch"],
+                                "successors": info["successors"],
+                                "replica_sha256": info["replica_sha256"],
+                            }
+                        self._send_json(out)
                     elif path == "/api/link":
                         payload = self._read_json()
+                        if self._node({"node_id": payload.get("src_node")}) is None:
+                            return
                         link = from_dict(LinkMeasurement, payload)
                         hub.registry.record_link(link)
                         self._send_json({"ok": True})
@@ -361,10 +678,66 @@ class Hub:
                         self._send_json({"ok": True, "bag_id": bag_id})
                     elif path == "/api/tasks/pull":
                         payload = self._read_json()
-                        pull = hub.handle_pull(str(payload.get("node_id", "")))
+                        if self._node(payload) is None:
+                            return
+                        pull = hub.handle_pull(
+                            str(payload.get("node_id", "")),
+                            wait_s=float(payload.get("wait_s") or 0.0),
+                        )
                         self._send_json({"ok": True, **pull})
+                    elif path == "/api/tasks/renew":
+                        payload = self._read_json()
+                        node_id = self._node(payload)
+                        if node_id is None:
+                            return
+                        renewed = hub.queue.renew(
+                            str(payload.get("node_id", "")),
+                            str(payload.get("bag_id") or ""),
+                            [int(x) for x in payload.get("seqs") or []],
+                            float(payload.get("lease_seconds") or 60.0),
+                        )
+                        self._send_json({"ok": True, "renewed": renewed})
+                    elif path == "/api/services/sync":
+                        payload = self._read_json()
+                        node_id = self._node(payload)
+                        if node_id is None:
+                            return
+                        self._send_json(hub.handle_services_sync(payload))
+                    elif path == "/api/models/deploy":
+                        payload = self._read_json()
+                        model = str(payload.get("model") or "")
+                        dep = hub.inference.deploy(
+                            model,
+                            force_shard=bool(payload.get("force_shard")),
+                            ctx=int(payload.get("ctx") or 4096),
+                        )
+                        wait_s = float(payload.get("wait_s") or 0.0)
+                        if wait_s > 0 and dep.get("state") not in ("ready", "failed"):
+                            dep = hub.inference.wait_ready(dep.get("model") or model, wait_s) or dep
+                        self._send_json({"ok": dep.get("state") != "failed", "deployment": dep})
+                    elif path.startswith("/api/bag/") and path.endswith("/cancel"):
+                        self._read_json()
+                        bag_id = path[len("/api/bag/") : -len("/cancel")]
+                        self._send_json({"ok": True, "cancelled": hub.queue.cancel_bag(bag_id)})
+                    elif path == "/api/models/undeploy":
+                        payload = self._read_json()
+                        stopped = hub.inference.undeploy(str(payload.get("model") or ""))
+                        self._send_json({"ok": stopped})
+                    elif path == "/api/nodes/revoke":
+                        payload = self._read_json()
+                        self._send_json({"ok": hub.auth.revoke_node(str(payload.get("node_id") or ""))})
+                    elif path == "/api/tokens":
+                        payload = self._read_json()
+                        minted = hub.enrollment.create(
+                            role=str(payload.get("role") or "node"),
+                            label=payload.get("label"),
+                            ttl_s=float(payload.get("ttl_s") or 7 * 86400.0),
+                        )
+                        self._send_json({"ok": True, **minted})
                     elif path == "/api/tasks/complete":
                         payload = self._read_json()
+                        if self._node(payload) is None:
+                            return
                         outcome = hub.queue.complete(
                             str(payload.get("node_id", "")),
                             list(payload.get("results") or []),
@@ -423,6 +796,8 @@ class Hub:
                             self._bad(str(exc))
                     elif path == "/api/spore/event":
                         payload = self._read_json()
+                        if self._node({"node_id": payload.get("node_id") or payload.get("seed_node_id")}) is None:
+                            return
                         hub.enrollment.log_spore_event(
                             str(payload.get("seed_node_id", "")),
                             str(payload.get("channel", "")),
@@ -431,17 +806,31 @@ class Hub:
                         self._send_json({"ok": True})
                     elif path == "/api/sharpen":
                         payload = self._read_json()
+                        if self._node({"node_id": payload.get("node_id") or payload.get("seed_node_id")}) is None:
+                            return
                         hub.handle_sharpen(payload)
                         self._send_json({"ok": True})
                     elif path == "/api/self-update":
                         payload = self._read_json()
+                        if self._node({"node_id": payload.get("node_id") or payload.get("seed_node_id")}) is None:
+                            return
                         if hub.latest_bundle_hash is None:
                             self._send_json({"ok": False, "error": "no bundle available"})
                         else:
+                            sig = None
+                            key_hash = hub.auth.node_key_hash(str(self.headers.get("X-Swarm-Node") or ""))
+                            if key_hash and hub.latest_bundle_hash:
+                                import hmac as _hmac
+
+                                sig = _hmac.new(
+                                    key_hash.encode("utf-8"), hub.latest_bundle_hash.encode("utf-8"), "sha256"
+                                ).hexdigest()
                             self._send_json(
                                 {
                                     "ok": True,
+                                    "sig": sig,
                                     "sha256": hub.latest_bundle_hash,
+                                    "code_hash": getattr(hub, "latest_code_hash", None),
                                     "url": "/api/bundle/latest",
                                     "size": len(hub.agent_payload or b""),
                                 }
@@ -515,8 +904,21 @@ a.btn{{display:inline-block;background:#3cc492;color:#0f1215;padding:12px 24px;b
 <p style="color:#556069;font-size:12px;margin-top:1.5em">Then run: <code>python swarm-agent.pyz --work</code> (bare Python 3.9+, no dependencies)</p>
 </div></body></html>"""
 
-    def handle_register(self, payload: Dict[str, Any]) -> str:
-        if self.require_token:
+    def _locked_page(self, message: str = "") -> str:
+        note = f"<p>{message}</p>" if message else ""
+        return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Swarm hub</title>
+<style>body{{font-family:system-ui,sans-serif;background:#0f1215;color:#dde2e7;display:flex;justify-content:center;padding:10vh 1em 0}}
+.card{{max-width:520px;background:#171c22;border:1px solid #2a3038;border-radius:10px;padding:2em}}
+h1{{font-size:20px;color:#3cc492;margin-top:0}} code{{background:#0f1215;padding:2px 6px;border-radius:4px;font-size:12px}}</style></head>
+<body><div class="card"><h1>Swarm hub</h1>{note}
+<p>This hub is locked. Open it with the owner key: <code>http://&lt;hub&gt;/?key=&lt;owner key&gt;</code></p>
+<p style="color:#556069;font-size:12px">The key is in <code>~/.swarm/owner.key</code> on the hub machine.</p>
+</div></body></html>"""
+
+    def handle_register(self, payload: Dict[str, Any], client_host: Optional[str] = None) -> str:
+        if self.require_token and client_host is None:
+            # Direct (non-HTTP) callers keep the old contract.
             token = str(payload.get("token") or "")
             valid = self.enrollment.validate(token)
             if valid is None:
@@ -534,10 +936,111 @@ a.btn{{display:inline-block;background:#3cc492;color:#0f1215;padding:12px 24px;b
             bench = from_dict(BenchResult, bench_data)
             self.registry.record_bench(profile.node_id, bench)
         self._apply_verdicts(profile, payload)
-        self._index_device_classes(profile)
+        inference = payload.get("inference") if isinstance(payload.get("inference"), dict) else None
+        # Always recorded, runtimes or not: where a node is reachable is what
+        # successor election (holo) and service binding need.
+        addresses = [str(a) for a in payload.get("addresses") or [] if a][:16]
+        self.inference.record_runtimes(profile.node_id, inference or {}, client_host, addresses)
+        extra = {
+            "can_hub": bool(payload.get("can_hub")),
+            "hub_port": int(payload.get("hub_port") or 8777),
+            "dedicated": bool(payload.get("dedicated")),
+            "code_worker": bool(payload.get("code_worker")),
+            "emulated": payload.get("emulated"),
+            "ops": [str(o) for o in (payload.get("ops") or [])][:64],
+        }
+        self.holo.record_node_extra(profile.node_id, extra)
+        self._index_device_classes(profile, inference, extra)
         return profile.node_id
 
-    def _index_device_classes(self, profile: NodeProfile) -> None:
+    def access_verifier(self) -> Optional[Dict[str, Any]]:
+        """The salted verifier of this swarm's local access code (lowprofile).
+        Minted from the owner key when this hub holds it; a restored hub
+        inherits it through the replica."""
+        raw = self.holo.settings.get("access_verifier")
+        if raw:
+            try:
+                return json.loads(raw)
+            except ValueError:
+                return None
+        if self.secure and self.auth.owner_key:
+            from .lowprofile import derive_access_code, make_verifier
+
+            verifier = make_verifier(derive_access_code(self.auth.owner_key))
+            self.holo.settings.set("access_verifier", json.dumps(verifier))
+            return verifier
+        return None
+
+    def bundle_config(self, base: str, token: str, **extra: Any) -> Dict[str, Any]:
+        config: Dict[str, Any] = {"hub": base, "token": token, **extra}
+        verifier = self.access_verifier()
+        if verifier:
+            config["access"] = verifier
+        return config
+
+    def node_summary(self, node_id: str) -> Dict[str, Any]:
+        """What the locked `status` view on a device shows about itself."""
+        detail = self.registry.node_detail(node_id) or {}
+        stats = self.queue.node_stats(node_id)
+        leased = self.registry._conn.execute(
+            "SELECT COUNT(*) AS n FROM tasks WHERE leased_to=? AND status='leased'", (node_id,)
+        ).fetchone()
+        rank = next((s["rank"] for s in self.holo.successors() if s["node_id"] == node_id), None)
+        return {
+            "ok": bool(detail),
+            "node_id": node_id,
+            "hostname": detail.get("hostname"),
+            "last_seen": detail.get("last_seen"),
+            "tier": stats.get("tier"),
+            "completions": stats.get("completions"),
+            "failures": stats.get("failures"),
+            "working_on": leased["n"] if leased else 0,
+            "services": self.inference.desired_for(node_id),
+            "successor_rank": rank,
+            "epoch": self.holo.epoch,
+            "classes": self.queue.node_device_classes(node_id),
+        }
+
+    def bundle_for(self, config: Optional[Dict[str, Any]] = None) -> bytes:
+        """The agent file, with a per-invite config baked in. Built from the
+        generic payload (so a hub running from a .pyz — a promoted successor —
+        can still hand out bundles), never re-read from a source tree."""
+        if self.agent_payload is None:
+            from .agentbundle import build_agent_pyz
+
+            self.set_agent_payload(build_agent_pyz())
+        if not config:
+            return self.agent_payload or b""
+        from ..agent.updater import with_config
+
+        return with_config(self.agent_payload or b"", json.dumps(config, sort_keys=True).encode("utf-8"))
+
+    def handle_services_sync(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """The service reconcile loop's hub half. The agent reports what is
+        actually running; the hub advances deployments and answers with what
+        SHOULD run. With `wait_s`, the answer is held until desired state for
+        this node changes (long-poll), so a deploy reaches nodes instantly."""
+        node_id = str(payload.get("node_id") or "")
+        self.registry.heartbeat(node_id)
+        self.inference.report(node_id, list(payload.get("services") or []))
+        self.inference.tick()
+        self.inference.notify()
+        wait_s = min(LONG_POLL_MAX_S, max(0.0, float(payload.get("wait_s") or 0.0)))
+        known = payload.get("version")
+        if wait_s > 0 and known is not None and int(known) == self.inference.version(node_id):
+            self.inference.wait_for_change(node_id, int(known), wait_s)
+        return {
+            "ok": True,
+            "version": self.inference.version(node_id),
+            "desired": self.inference.desired_for(node_id),
+        }
+
+    def _index_device_classes(
+        self,
+        profile: NodeProfile,
+        inference: Optional[Dict[str, Any]] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Record which device classes this node can serve, from its MEASURED
         profile — this is what turns `device_class` work routing on.
 
@@ -560,6 +1063,20 @@ a.btn{{display:inline-block;background:#3cc492;color:#0f1215;padding:12px 24px;b
         for runtime in getattr(profile, "runtimes", None) or []:
             if runtime:
                 classes.add("runtime:{}".format(str(runtime).strip().lower()))
+        # What the agent's runtime discovery found (probe/runtimes.py): the
+        # runtime answered and listed its models, so these are observed facts
+        # about the machine. This is what routes chat/embed to the node that
+        # actually holds the model.
+        classes.update(Inference.device_classes(inference))
+        extra = extra or {}
+        if extra.get("code_worker"):
+            # opted in to running code an AI wrote (MCP tools target this)
+            classes.add("role:code-worker")
+        # Which ops this node can execute. "op:*" (python agents: every op,
+        # plus adapters) or an explicit list (browser workers). A node that
+        # sent nothing is a pre-ops agent and is treated as "op:*".
+        ops = extra.get("ops") or ["*"]
+        classes.update(f"op:{o}" for o in ops)
         for dev in getattr(profile, "devices", None) or []:
             vendor = getattr(dev, "vendor", None)
             name = getattr(dev, "name", None)
@@ -617,16 +1134,38 @@ a.btn{{display:inline-block;background:#3cc492;color:#0f1215;padding:12px 24px;b
         # silently turned every classed submission into unrestricted work —
         # the HTTP path is the only one real agents use.
         device_class = payload.get("device_class")
+        priority = max(-10, min(9, int(payload.get("priority") or 0)))  # 10+ is reserved for interactive chat
         return self.queue.submit_bag(
             op,
             params_list,
             idem_keys,
             device_class=str(device_class) if device_class else None,
+            priority=priority,
         )
 
-    def handle_pull(self, node_id: str) -> Dict[str, Any]:
+    def handle_pull(self, node_id: str, wait_s: float = 0.0) -> Dict[str, Any]:
+        """Pull a chunk. With `wait_s` > 0 this is a long-poll: an idle node's
+        request is held until work that it can serve may exist, so a chat
+        request reaches a node in milliseconds instead of a poll interval."""
+        wait_s = min(LONG_POLL_MAX_S, max(0.0, float(wait_s)))
+        deadline = time.time() + wait_s
+        while True:
+            seen = self.queue.work_seq
+            out = self._pull_once(node_id)
+            remaining = deadline - time.time()
+            if out.get("tasks") or out.get("suspended") or remaining <= 0 or self._stopping:
+                return out
+            # capped so lease expiries (swept on pull) are still noticed
+            self.queue.wait_for_work(seen, min(remaining, 5.0))
+
+    def _pull_once(self, node_id: str) -> Dict[str, Any]:
         if self.queue.is_suspended(node_id):
             return {"tasks": [], "suspended": True}
+        if self.inference.desired_for(node_id):
+            # Thinking nodes do not do chores: a node holding model layers is
+            # memory-bandwidth-bound on every token; batch work on it would
+            # slow the model for everyone. Other nodes take the bag.
+            return {"tasks": [], "suspended": False, "busy_serving": True}
         open_bags = self.queue.open_bags()
         if not open_bags:
             return {"tasks": self.queue.pull_hedges(node_id), "suspended": False}
@@ -728,13 +1267,71 @@ a.btn{{display:inline-block;background:#3cc492;color:#0f1215;padding:12px 24px;b
 
     def stop(self) -> None:
         self.stop_lan_announce()
+        self.holo.stop()
+        self._stopping = True
+        # Release every long-poll waiter before the database goes away.
+        self.queue.notify_work()
+        self.queue.notify_results()
+        self.inference.notify()
+        with contextlib.suppress(Exception):
+            self.inference._bump("__stop__")
         if self._httpd is not None:
             self._httpd.shutdown()
             self._httpd.server_close()
         self.registry.close()
 
 
-def main() -> None:
+def _service_unit(host: str, port: int, db: str) -> str:
+    import sys as _sys
+
+    exe = _sys.executable
+    target = _sys.argv[0] if _sys.argv and _sys.argv[0].endswith(".pyz") else None
+    run = f"{exe} {target} --run-hub" if target else f"{exe} -m swarm.hub.server"
+    workdir = str(Path(__file__).resolve().parents[2]) if not target else str(Path(target).parent)
+    return f"""[Unit]
+Description=Swarm hub - coordinator for the device swarm
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+WorkingDirectory={workdir}
+ExecStart={run} --host {host} --port {port} --db {db}
+Restart=always
+RestartSec=5
+Nice=5
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def _generic_payload() -> bytes:
+    """The agent bundle to serve: built from source, or — when this hub is
+    itself running from a .pyz (a promoted successor) — that very file with
+    its per-node config removed."""
+    import sys as _sys
+
+    from .agentbundle import build_agent_pyz
+
+    try:
+        return build_agent_pyz()
+    except Exception:
+        argv0 = _sys.argv[0] if _sys.argv else ""
+        if not argv0.endswith(".pyz"):
+            raise
+        import io
+        import zipfile
+
+        src = Path(argv0).read_bytes()
+        out = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(src)) as zin, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                if item.filename != "swarm_config.json":
+                    zout.writestr(item, zin.read(item.filename))
+        return out.getvalue()
+
+
+def main(argv: Optional[list] = None) -> None:
     parser = argparse.ArgumentParser(description="Swarm hub")
     parser.add_argument(
         "--host",
@@ -761,7 +1358,19 @@ def main() -> None:
         action="store_true",
         help="build and serve the single-file agent at /agent.pyz",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--open",
+        action="store_true",
+        help="LAB ONLY: no owner key, no node keys, no enrollment tokens, even off-loopback",
+    )
+    parser.add_argument("--secure", action="store_true", help="require keys even on loopback (simulations)")
+    parser.add_argument("--epoch", type=int, default=None, help="(failover) serve at this epoch")
+    parser.add_argument(
+        "--install-service",
+        action="store_true",
+        help="Linux: write and start a systemd unit for this hub (needs root), then exit",
+    )
+    args = parser.parse_args(argv)
     if args.db is None:
         state_dir = Path.home() / ".swarm"
         state_dir.mkdir(parents=True, exist_ok=True)
@@ -771,14 +1380,37 @@ def main() -> None:
     host = args.host
     if args.lan and host == "127.0.0.1":
         host = "0.0.0.0"  # explicit operator opt-in via --lan
-    hub = Hub(host=host, port=args.port, db_path=db)
-    if args.serve_agent:
-        from .agentbundle import build_agent_pyz
+    if args.install_service:
+        unit = Path("/etc/systemd/system/swarm-hub.service")
+        unit.write_text(_service_unit(host, args.port, db), encoding="utf-8")
+        import subprocess as _sp
 
-        payload = build_agent_pyz()
-        hub.set_agent_payload(payload)
-        print(f"agent bundle ready at /agent.pyz ({len(payload)} bytes)")
-    print(f"swarm hub listening on http://{host}:{args.port} (dashboard at /, db={db})")
+        _sp.run(["systemctl", "daemon-reload"], check=False)
+        _sp.run(["systemctl", "enable", "--now", "swarm-hub.service"], check=False)
+        print(f"installed {unit}; status: systemctl status swarm-hub")
+        return
+    secure_flag: Optional[bool] = False if args.open else (True if args.secure else None)
+    hub = Hub(host=host, port=args.port, db_path=db, secure=secure_flag)
+    if args.epoch is not None and args.epoch > hub.holo.epoch:
+        hub.holo.set_epoch(args.epoch)
+    # Always built: joined nodes self-update from it, /agent.pyz serves it.
+    # (--serve-agent is kept as a no-op for old command lines.)
+    payload = _generic_payload()
+    hub.set_agent_payload(payload)
+    hub.holo.start_peer_watch()
+    print(f"agent bundle ready at /agent.pyz ({len(payload)} bytes, code {str(hub.latest_code_hash)[:12]})")
+    print(
+        f"swarm hub listening on http://{host}:{args.port} (dashboard at /, db={db}) "
+        f"swarm {hub.holo.swarm_id} epoch {hub.holo.epoch}",
+        flush=True,
+    )
+    if hub.secure:
+        key_file = Path(db).parent / "owner.key" if db != ":memory:" else Path.home() / ".swarm" / "owner.key"
+        print(f"secure mode: owner key in {key_file} (also the /v1 API key)")
+        print("  dashboard:   http://<this-host>:%d/?key=<owner key>" % args.port)
+        print("  add devices: http://<this-host>:%d/join  (owner page with one-line installers)" % args.port)
+    elif not is_loopback(host):
+        print("WARNING: --open on a non-loopback address: anyone who can reach this port can run code on every node.")
     if args.lan:
         url = hub.start_lan_announce()
         if url:

@@ -129,7 +129,8 @@ class Workshop:
     def _sandbox_test(self, files: Dict[str, str]) -> tuple:
         """Apply to a copy of the tree; run the full test suite there. Never
         raises; returns (ok, log)."""
-        with tempfile.TemporaryDirectory(prefix="swarm-workshop-") as tmp:
+        tmp = tempfile.mkdtemp(prefix="swarm-workshop-")
+        try:
             dest = Path(tmp) / "tree"
             ignore = shutil.ignore_patterns(".git", ".venv", "__pycache__", "*.db", "*.db-journal")
             shutil.copytree(self.root, dest, ignore=ignore)
@@ -143,19 +144,17 @@ class Workshop:
                 ("compileall", [sys.executable, "-m", "compileall", "-q", "swarm"]),
                 (
                     "pytest",
-                    [sys.executable, "-m", "pytest", "tests", "-q", "-x", "--tb=line", "-k", "not workshop"],
+                    # `slow` end-to-end tests (real hub processes, failover) run in
+                    # CI; inside every proposal's sandbox they would cost minutes each
+                    [sys.executable, "-m", "pytest", "tests", "-q", "-x", "--tb=line", "-k", "not workshop",
+                     "-m", "not slow"],
                 ),
                 (
                     "stdlib-gate",
                     [
                         sys.executable,
                         "scripts/check_stdlib_imports.py",
-                        "swarm/core",
-                        "swarm/probe",
-                        "swarm/bench",
-                        "swarm/agent",
-                        "swarm/transport",
-                        "swarm/integrator",
+                        "swarm",
                     ],
                 ),
             ):
@@ -177,6 +176,10 @@ class Workshop:
                     ok_all = False
                     break
             return ok_all, "\n".join(logs)
+        finally:
+            # Windows may keep a handle open a moment after a child exits;
+            # a leftover temp dir is harmless, a crashed gate is not.
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def approve_and_apply(self, patch_id: str) -> Dict[str, Any]:
         row = self._get(patch_id)

@@ -9,7 +9,7 @@ from __future__ import annotations
 import html
 import json
 import time
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from .queue import WorkQueue
 from .registry import Registry
@@ -116,7 +116,68 @@ def _fleet_power_rows(registry: Registry) -> str:
     return "".join(rows) or '<tr><td colspan="3" class="none">no benchmarks yet</td></tr>'
 
 
-def render_dashboard(registry: Registry, queue: Optional[WorkQueue] = None) -> str:
+def _model_rows(inference: Any) -> str:
+    """What the fleet can serve right now, and where each deployment stands."""
+    if inference is None:
+        return ""
+    try:
+        catalog = inference.catalog()
+        deployments = {d["model"]: d for d in inference.list_deployments()}
+    except Exception:
+        return '<tr><td colspan="5" class="none">model catalog unavailable</td></tr>'
+    rows = []
+    for m in catalog:
+        dep = deployments.get(m["name"])
+        if dep is None:
+            state = '<span class="none">on demand</span>'
+            where = ""
+        else:
+            css = {"ready": "t-verified", "failed": "t-theoretical"}.get(dep["state"], "t-standard")
+            state = f'<span class="trust {css}">{html.escape(dep["state"])}</span>'
+            plan = dep.get("plan") or {}
+            parts = plan.get("participants") or []
+            where = html.escape(
+                ", ".join(
+                    f"{(p.get('hostname') or p['node_id'][:8])}"
+                    + (f" ({p['layers']} layers)" if p.get("layers") else "")
+                    for p in parts
+                )
+            )
+            if dep.get("reason") and dep["state"] in ("failed", "stopped"):
+                where += f'<br><span class="meta">{html.escape(str(dep["reason"])[:240])}</span>'
+        size = m.get("size_bytes")
+        rows.append(
+            f'<tr><td class="mono">{html.escape(m["name"])}</td>'
+            f"<td>{html.escape(m['kind'])} &middot; {html.escape(str(m.get('runtime')))}</td>"
+            f"<td>{_fmt_bytes(size) if isinstance(size, int) else '&mdash;'}</td>"
+            f"<td>{html.escape(', '.join(n['hostname'] for n in m['nodes']))}</td>"
+            f"<td>{state} {where}</td></tr>"
+        )
+    return "".join(rows)
+
+
+def _holo_line(inference: Any) -> str:
+    """Who would take over if this hub died (holographic failover)."""
+    hub = getattr(inference, "hub", None)
+    holo = getattr(hub, "holo", None)
+    if holo is None:
+        return ""
+    try:
+        succ = holo.successors()
+    except Exception:
+        return ""
+    names = ", ".join(html.escape(str(s.get("hostname") or s["node_id"][:8])) for s in succ) or \
+        '<span class="warn">none yet - add a dedicated always-on node</span>'
+    note = ""
+    if holo.demoted:
+        note = f' &middot; <span class="err">stepped aside for {html.escape(str(holo.demoted.get("moved_to")))}</span>'
+    return (
+        f'<div class="meta">swarm <span class="mono">{html.escape(holo.swarm_id)}</span> &middot; epoch {holo.epoch}'
+        f" &middot; successors if this hub dies: {names}{note}</div>"
+    )
+
+
+def render_dashboard(registry: Registry, queue: Optional[WorkQueue] = None, inference: Any = None) -> str:
     nodes = registry.list_nodes()
     links = registry.list_links()
     anomalies = registry.recent_anomalies(20)
@@ -203,7 +264,13 @@ def render_dashboard(registry: Registry, queue: Optional[WorkQueue] = None) -> s
 <meta http-equiv="refresh" content="15">
 <style>{STYLE}</style></head><body>
 <h1>Swarm &mdash; measured, not declared</h1>
-<div class="meta">values shown with their trust tier; &mdash; means "we could not measure it" &middot; <a href="/api/fleet-power" style="color:#3cc492">/api/fleet-power</a></div>
+<div class="meta">values shown with their trust tier; &mdash; means "we could not measure it" &middot; <a href="/api/fleet-power" style="color:#3cc492">/api/fleet-power</a>
+&middot; <a href="/join" style="color:#3cc492;font-weight:600">+ add a device</a> &middot; OpenAI-compatible API at <span class="mono">/v1</span> (owner key = API key)</div>
+{_holo_line(inference)}
+<h2>Models</h2>
+<table><tr><th>Model</th><th>Kind</th><th>Size</th><th>Held by</th><th>Serving</th></tr>
+{_model_rows(inference) or '<tr><td colspan="5" class="none">No servable models yet. Nodes report Ollama models automatically; drop GGUF files in ~/.swarm/models on a node with llama.cpp.</td></tr>'}
+</table>
 <h2>Fleet Power ({len(nodes)} nodes)</h2>
 <table><tr><th>Measure</th><th>Proven total</th><th>Fallback-tier total</th></tr>
 {_fleet_power_rows(registry)}

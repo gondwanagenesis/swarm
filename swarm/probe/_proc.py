@@ -11,15 +11,16 @@ from typing import List, Optional
 
 
 def run_bounded(
-    cmd: List[str], timeout: float = 15.0, max_output: int = 2_000_000
+    cmd: List[str], timeout: float = 15.0, max_output: int = 2_000_000, merge_stderr: bool = False
 ) -> Optional[str]:
     """Run cmd with a hard timeout. Returns stdout text or None on any failure.
-    Never raises."""
+    Never raises. `merge_stderr` folds stderr into the text, for tools (like
+    llama.cpp) that print their version and help there."""
     try:
         proc = subprocess.run(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT if merge_stderr else subprocess.DEVNULL,
             timeout=timeout,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )

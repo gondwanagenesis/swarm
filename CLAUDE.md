@@ -9,8 +9,8 @@ Measurements only. Nothing enters the schedulable pool by declaration.
 
 ## Non-negotiables while editing
 
-- `swarm/core`, `swarm/probe`, `swarm/bench`, `swarm/agent`, `swarm/transport`
-  import **Python standard library only**. `scripts/check_stdlib_imports.py`
+- **All of `swarm/`** imports **Python standard library only** (holographic:
+  every node carries and may run the hub). `scripts/check_stdlib_imports.py swarm`
   enforces this in CI; it will fail your PR.
 - `swarm/probe` code **never raises and never hangs**. Every collector returns
   partial data + `Anomaly` records. Every subprocess goes through
@@ -39,7 +39,15 @@ Measurements only. Nothing enters the schedulable pool by declaration.
 | `swarm/bench` | fallback calibration benchmarks | stdlib |
 | `swarm/agent` | node daemon | stdlib |
 | `swarm/transport` | link measurement | stdlib |
-| `swarm/hub` | registry (sqlite3) + server (http.server) + dashboard | stdlib today; FastAPI extras reserved in pyproject |
+| `swarm/hub` | registry (sqlite3) + server (http.server) + dashboard + `auth` (owner/node keys) + `inference` (model placement, deployments) + `gateway` (OpenAI `/v1`) + `join` (joiners, seed kit) | stdlib today; FastAPI extras reserved in pyproject |
+| `swarm/probe/runtimes.py` | discovers Ollama models, llama.cpp binaries + device free memory, GGUF files | stdlib |
+| `swarm/agent/services.py` | reconciles hub-desired llama.cpp services (rpc-server / llama-server) | stdlib |
+| `swarm/agent/join_scripts.py` | POSIX + PowerShell joiners, seed kit builder | stdlib |
+| `swarm/cli.py` | owner CLI: status, models, chat, deploy, plan, map, join | stdlib |
+| `swarm/mcp.py` | MCP server: the swarm as tools for AI brains (code-worker gated) | stdlib |
+| `swarm/hub/holo.py`, `swarm/agent/holo.py` | holographic hub: successors, replicas, epochs, failover | stdlib |
+| `swarm/hub/browser_worker.py` | `/worker` page: browsers as nodes | stdlib (serves JS) |
+| `scripts/simulate_fleet.py` | whole-fleet simulation with chaos → `docs/SIMULATION.md` | stdlib |
 | `swarm/integrator` | M4 placeholder — do not build before M2/M3 | — |
 | `contracts/` | home of capability contracts + known-good/known-bad (M4) | — |
 | `tests/` | pytest, dev-only dependency | pytest |
@@ -48,7 +56,7 @@ Measurements only. Nothing enters the schedulable pool by declaration.
 
 ```sh
 python -m pytest tests/ -x --tb=short
-python scripts/check_stdlib_imports.py swarm/core swarm/probe swarm/bench swarm/agent swarm/transport
+python scripts/check_stdlib_imports.py swarm
 python -m compileall -q swarm
 python scripts/demo.py          # full loop: hub + agent + probe + bench + dashboard
 ```
