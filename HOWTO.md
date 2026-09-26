@@ -97,6 +97,7 @@ Useful options (set before the line, e.g. `DEDICATED=1 curl … | sh`):
 
 | Option | Meaning |
 |---|---|
+| `CODE_WORKER=0/1` | override the code-worker default (see 2.4) |
 | `DEDICATED=1` | this device exists to compute (closet PC, phone on a charger): keep working while someone uses it. Battery and heat rules still apply. Phones are dedicated by default. |
 | `CODE_WORKER=1` | accept code written by your AI tools (see 2.4). On by default for Android phones, off elsewhere. |
 | `AUTOSTART=0` | don't start on boot |
@@ -106,6 +107,36 @@ On Windows the same options are `$env:SWARM_DEDICATED=1`, etc.
 
 A device appears on the dashboard within a minute. After that you never
 need to touch it again.
+
+### 1.5 Devices stay quiet — and open with your code
+
+Nothing on a device announces the swarm: no windows, no terminal output, no
+open ports, a hidden folder, owner-only log and key files, and a neutral
+service name (**ComputeNode** at Windows logon, **compute-node** in
+systemd / Termux / macOS). Someone else using the device sees nothing
+worth asking about.
+
+To look at a device, open a terminal on it and run its status command. It
+asks for your **access code** (typed input is hidden, like a password):
+
+```bash
+python3 ~/.swarm/swarm-agent.pyz status          # Linux / macOS / Android
+python %USERPROFILE%\.swarm\swarm-agent.pyz status   # Windows
+```
+
+- Right code: which hub, what it is doing (or why it is resting), tasks done,
+  whether it is a successor, and the recent log.
+- Wrong code: the single word `no`. Nothing else.
+- Same code for `pause` (take no new work), `resume`, and `leave` (shows the
+  exact line that removes this device).
+
+Your access code is shown on the dashboard's **+ add a device** page. It is
+derived from your owner key, so you can always see it again there; devices
+store only a salted hash of it, never the code itself.
+
+The hub is just as quiet: to anyone without your key, a device key, or a
+valid invite, every address answers a plain `404 Not Found` — no name, no
+version, nothing to fingerprint.
 
 ### 1.4 Give the fleet a model
 

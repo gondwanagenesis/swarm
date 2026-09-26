@@ -42,9 +42,14 @@ def _call(port, path, payload=None, headers=None):
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status, json.loads(resp.read() or b"{}")
+            raw = resp.read() or b"{}"
+            code = resp.status
     except urllib.error.HTTPError as exc:
-        return exc.code, json.loads(exc.read() or b"{}")
+        raw, code = exc.read() or b"{}", exc.code
+    try:
+        return code, json.loads(raw)
+    except ValueError:
+        return code, {"raw": raw.decode("utf-8", "replace")}
 
 
 def _register(port, node_id, token=None, **extra):
@@ -76,7 +81,7 @@ def test_identity_is_minted_once_and_replicates(tmp_path):
         assert b.auth.owner_key is None, "a restored hub never holds the owner key itself"
         # the owner's key still works (verified against its hash)...
         assert _call(port, "/api/nodes", headers={"Authorization": f"Bearer {OWNER}"})[0] == 200
-        assert _call(port, "/api/nodes", headers={"Authorization": "Bearer nope"})[0] == 401
+        assert _call(port, "/api/nodes", headers={"Authorization": "Bearer nope"})[0] == 404
         # ...and so does the node's key: it re-attaches without a new token
         hdr = {"X-Swarm-Node": "n1", "X-Swarm-Node-Key": key}
         assert _call(port, "/api/heartbeat", {"node_id": "n1"}, hdr)[0] == 200
@@ -230,3 +235,21 @@ def test_a_promotion_race_resolves_toward_the_better_rank(tmp_path):
     finally:
         winner.stop()
         loser.stop()
+
+
+def test_advertised_replica_tracks_new_members(monkeypatch):
+    """Regression (found by the fleet simulation): a successor's replica must
+    include nodes that joined after its first download, or a promoted hub
+    would not know their keys and they could never re-attach."""
+    monkeypatch.setenv("SWARM_REPLICA_MAX_AGE_S", "3600")  # only membership changes may refresh it
+    hub = Hub(host="127.0.0.1", port=0, secure=True, owner_key=OWNER)
+    _, port = hub.start_background()
+    try:
+        token = hub.enrollment.create()["token"]
+        _register(port, "early", token, can_hub=True)
+        first = hub.holo.info()["replica_sha256"]
+        assert hub.holo.info()["replica_sha256"] == first, "stable while nothing changes"
+        _register(port, "late", token)
+        assert hub.holo.info()["replica_sha256"] != first, "a new member's key must reach the successors"
+    finally:
+        hub.stop()

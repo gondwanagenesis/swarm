@@ -35,6 +35,16 @@ as the work it describes.
 
 ---
 
+## K. Low profile (owner request, 2026-09-26: "blend in; open with a secret code")
+
+| # | Requirement | Status | Evidence / gap |
+|---|---|---|---|
+| K1 | A secure hub is dark to strangers: plain 404, generic server header, no name / version / swarm id | ✅ | `tests/test_lowprofile.py` sweeps 11 paths; live: a stranger saw HTTP 404 on Windows and Linux test hubs |
+| K2 | Swarm-internal endpoints (hub info, agent file, updates, worker page) answer only a node key, the owner key, a valid invite, or a signed peer hub | ✅ | Peer hubs sign with HMAC(owner-key hash, timestamp), 5-minute window; replayed signatures refused |
+| K3 | Devices show nothing: no windows, no output, hidden folder, owner-only logs/keys, neutral service names (ComputeNode / compute-node) | ✅ Windows, Linux · 🟡 macOS, Termux | Live on Windows (hidden folder, `ComputeNode` Run entry) and Linux (`compute-node` systemd unit) |
+| K4 | A device opens only with the access code (`status`, `pause`, `resume`, `leave`); wrong code → `no` | ✅ | Live on Windows and Linux: wrong code printed `no`; right code showed hub, state, tasks, successor rank, log. Devices hold only a salted PBKDF2 verifier |
+| K5 | No disguise: the agent is never presented as a system process or hidden from antivirus / Task Manager | ✅ by design | Low profile, not deception: processes stay honestly `python`/`pythonw`; files stay in the user's own profile |
+
 ## H. Holographic & break-resistant (priorities 1 and 4)
 
 | # | Requirement | Status | Evidence / gap |
@@ -47,6 +57,8 @@ as the work it describes.
 | H6 | Every node carries the WHOLE swarm (hub code too — it is stdlib) | ✅ | Agent file ships hub + integrator + CLI + MCP; CI gates the whole package stdlib-only; `tests/test_agentbundle.py` runs a hub FROM the agent file |
 | H7 | Hub state is replicated to several nodes continuously | ✅ | Up to 3 ranked successors pull a pruned, gzipped, hashed snapshot when it changes (`/api/replica`); `tests/test_holo.py` |
 | H8 | Hub loss → a successor restarts the hub from the latest replica; nodes re-attach on their own | ✅ | `tests/test_holo.py::test_hub_failover_end_to_end`: real hub killed, successor promotes a NEW hub process at epoch 2, the other node follows, new work completes. Old hub steps aside (HTTP 409 `moved_to`) on seeing a higher epoch |
+| H8b | Every surviving node re-attaches after a failover — including nodes that joined seconds before the hub died | ✅ | Simulation S9 alone: 8/8 re-attached in 13 s. Found + fixed: the advertised replica went stale (rebuilt only when fetched, fetched only when changed); now rebuilt on membership change and at least every 30 s. Nodes missing from a replica re-join with their original invite |
+| H8c | A node's heartbeat (its lifeline) survives any error | ✅ | Each heartbeat iteration is guarded and logged; a single exception used to end it silently |
 | H9 | Owner key survives a hub loss without being copied in plaintext to every node | ✅ | Replicas carry only its sha256; a restored hub verifies against the hash (`test_identity_is_minted_once_and_replicates`) |
 | H10 | Nothing in the swarm depends on one cloud service being up | ✅ | GitHub is touched only at join time (llama.cpp download); hub, agents, failover, updates all run inside the fleet |
 

@@ -39,7 +39,7 @@ def hub(monkeypatch):
 
 def test_join_page_is_owner_only_and_mints_invites(hub):
     h, port = hub
-    assert _get(port, "/join")[0] == 401
+    assert _get(port, "/join")[0] == 404
     code, page = _get(port, "/join", {"Authorization": f"Bearer {OWNER}"})
     assert code == 200
     text = page.decode()
@@ -51,7 +51,7 @@ def test_join_page_is_owner_only_and_mints_invites(hub):
 
 def test_joiners_refuse_bad_tokens_and_bake_the_hub(hub):
     h, port = hub
-    assert _get(port, "/join.sh?token=swk_nope")[0] == 403
+    assert _get(port, "/join.sh?token=swk_nope")[0] == 404
     token = h.enrollment.create()["token"]
     code, script = _get(port, f"/join.sh?token={token}&dedicated=1")
     assert code == 200

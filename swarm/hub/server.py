@@ -47,7 +47,10 @@ MAX_ECHO = 8 * 1024 * 1024
 LONG_POLL_MAX_S = 25.0
 
 # Who may call what (auth.py). Anything not listed here is an OWNER route.
-PUBLIC_GET = frozenset({"/api/ping", "/agent.pyz", "/api/bundle/latest", "/api/hubinfo", "/worker"})
+PUBLIC_GET = frozenset({"/api/ping"})
+# Routes that check their own credential (node key, invite token, owner key,
+# or a peer-hub signature) and answer a plain 404 to everyone else.
+SELF_GATED_GET = frozenset({"/agent.pyz", "/api/bundle/latest", "/api/hubinfo", "/worker", "/api/me"})
 # Token-gated GETs validate the enrollment token themselves.
 TOKEN_GET = frozenset({"/bundle.pyz", "/join.sh", "/join.ps1", "/join/seed-kit.zip", "/api/replica"})
 PUBLIC_POST = frozenset({"/api/echo", "/api/register"})
@@ -220,7 +223,9 @@ class Hub:
         hub = self
 
         class Handler(BaseHTTPRequestHandler):
-            server_version = "SwarmHub/0.1"
+            # Low profile: nothing in the headers says what this is.
+            server_version = "httpd"
+            sys_version = ""
 
             def log_message(self, format: str, *args: Any) -> None:
                 return
@@ -267,7 +272,23 @@ class Hub:
             def _owner(self) -> bool:
                 return hub.auth.is_owner(self.headers, self._query())
 
+            def _not_found(self) -> None:
+                body = b"Not Found"
+                self.send_response(404)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
             def _deny(self, path: str) -> None:
+                if hub.secure:
+                    # Dark to strangers (lowprofile.py): API clients get a bare
+                    # 401 so a wrong key is diagnosable; everything else, 404.
+                    if path.startswith("/v1/"):
+                        self._send_json(openai_error("invalid API key", "unauthorized", 401), status=401)
+                    else:
+                        self._not_found()
+                    return
                 if path.startswith("/v1/"):
                     self._send_json(
                         openai_error("missing or wrong API key (use the hub owner key)", "unauthorized", 401),
@@ -283,8 +304,18 @@ class Hub:
                 claimed = str(payload.get("node_id") or "") or None
                 node_id = hub.auth.is_node(self.headers, claimed)
                 if node_id is None:
-                    self._send_json({"ok": False, "error": "unknown node or bad node key; re-enroll"}, status=401)
+                    body = {"ok": False} if hub.secure else {"ok": False, "error": "unknown node or bad node key; re-enroll"}
+                    self._send_json(body, status=401)
                 return node_id
+
+            def _peer(self) -> bool:
+                from .lowprofile import peer_ok
+
+                return peer_ok(self.headers, hub.auth.owner_key_hash)
+
+            def _token_ok(self) -> bool:
+                token = str(self._query().get("token") or self.headers.get("X-Swarm-Token") or "")
+                return bool(token) and hub.enrollment.validate(token) is not None
 
             def _public_base(self) -> str:
                 """The URL this client used to reach us — what a bundle or a
@@ -298,13 +329,36 @@ class Hub:
                     if hub.holo.demoted and path not in ("/api/ping", "/api/hubinfo"):
                         self._send_json({"ok": False, **hub.holo.demoted, "error": "this hub stepped aside"}, status=409)
                         return
-                    gated = path not in PUBLIC_GET and path not in TOKEN_GET and not path.startswith("/invite")
+                    gated = (
+                        path not in PUBLIC_GET
+                        and path not in TOKEN_GET
+                        and path not in SELF_GATED_GET
+                        and not path.startswith("/invite")
+                    )
                     if gated and not self._owner():
                         self._deny(path)
                         return
+                    if path in SELF_GATED_GET and hub.secure:
+                        allowed = self._owner() or hub.auth.is_node(self.headers, None) is not None
+                        if path == "/api/hubinfo":
+                            # a node that joined seconds before the old hub died
+                            # may be missing from the replica: its invite (which
+                            # IS in the replica) still proves membership
+                            allowed = allowed or self._peer() or self._token_ok()
+                        if path in ("/agent.pyz", "/worker"):
+                            allowed = allowed or self._token_ok()
+                        if not allowed:
+                            self._not_found()
+                            return
+                    if path == "/api/me":
+                        node_id = hub.auth.is_node(self.headers, None)
+                        if node_id is None or node_id == "local":
+                            node_id = str(self._query().get("node_id") or "")
+                        self._send_json(hub.node_summary(node_id))
+                        return
                     if path == "/api/hubinfo":
-                        # public on purpose: a node in failover (or a peer hub
-                        # deciding whether to step aside) must be able to ask
+                        # nodes in failover and peer hubs deciding whether to
+                        # step aside ask this; strangers got a 404 above
                         info = hub.holo.info()
                         self._send_json(
                             {
@@ -369,13 +423,10 @@ class Hub:
                             }
                         )
                     elif path == "/agent.pyz":
-                        if hub.agent_payload is None:
-                            self._send_json(
-                                {"ok": False, "error": "agent bundle not built on this hub"},
-                                status=404,
-                            )
+                        body = hub.bundle_for(None)  # builds it on first use
+                        if not body:
+                            self._not_found()
                         else:
-                            body = hub.agent_payload
                             self.send_response(200)
                             self.send_header("Content-Type", "application/octet-stream")
                             self.send_header("Content-Disposition", "attachment; filename=swarm-agent.pyz")
@@ -421,7 +472,7 @@ class Hub:
                             if hub.secure and not self._owner():
                                 # A stranger with no valid invite gets no token:
                                 # minting one here would make enrollment a formality.
-                                self._send_html(hub._locked_page("This invite link is invalid or expired."), status=403)
+                                self._not_found()
                                 return
                             minted = hub.enrollment.create(role="node", label="invite-page")
                             token = minted["token"]
@@ -432,9 +483,12 @@ class Hub:
                         q = parse_qs(urlparse(self.path).query)
                         token = (q.get("token") or [""])[0]
                         if hub.enrollment.validate(token) is None:
-                            self._send_json({"ok": False, "error": "invalid or expired token"}, status=403)
+                            if hub.secure:
+                                self._not_found()
+                            else:
+                                self._send_json({"ok": False, "error": "invalid or expired token"}, status=403)
                             return
-                        bundle = hub.bundle_for({"hub": self._public_base(), "token": token})
+                        bundle = hub.bundle_for(hub.bundle_config(self._public_base(), token))
                         self.send_response(200)
                         self.send_header("Content-Type", "application/octet-stream")
                         self.send_header("Content-Disposition", "attachment; filename=swarm-agent.pyz")
@@ -582,14 +636,18 @@ class Hub:
                         if hub.require_token and not rejoining and not (hub.secure and self._owner()):
                             token = str(payload.get("token") or "")
                             if hub.enrollment.validate(token, consume=True) is None:
-                                self._send_json(
-                                    {"ok": False, "error": "missing or invalid enrollment token"}, status=403
-                                )
+                                if hub.secure:
+                                    self._not_found()  # dark: no hint that this is a join endpoint
+                                else:
+                                    self._send_json(
+                                        {"ok": False, "error": "missing or invalid enrollment token"}, status=403
+                                    )
                                 return
                         node_id = hub.handle_register(payload, client_host=self.client_address[0])
                         out: Dict[str, Any] = {"ok": True, "node_id": node_id}
                         if hub.secure and not rejoining:
                             out["node_key"] = hub.auth.issue_node_key(node_id)
+                            hub.holo.mark_dirty()  # successors must learn this key soon
                         self._send_json(out)
                     elif path == "/api/heartbeat":
                         payload = self._read_json()
@@ -894,6 +952,54 @@ h1{{font-size:20px;color:#3cc492;margin-top:0}} code{{background:#0f1215;padding
         self.holo.record_node_extra(profile.node_id, extra)
         self._index_device_classes(profile, inference, extra)
         return profile.node_id
+
+    def access_verifier(self) -> Optional[Dict[str, Any]]:
+        """The salted verifier of this swarm's local access code (lowprofile).
+        Minted from the owner key when this hub holds it; a restored hub
+        inherits it through the replica."""
+        raw = self.holo.settings.get("access_verifier")
+        if raw:
+            try:
+                return json.loads(raw)
+            except ValueError:
+                return None
+        if self.secure and self.auth.owner_key:
+            from .lowprofile import derive_access_code, make_verifier
+
+            verifier = make_verifier(derive_access_code(self.auth.owner_key))
+            self.holo.settings.set("access_verifier", json.dumps(verifier))
+            return verifier
+        return None
+
+    def bundle_config(self, base: str, token: str, **extra: Any) -> Dict[str, Any]:
+        config: Dict[str, Any] = {"hub": base, "token": token, **extra}
+        verifier = self.access_verifier()
+        if verifier:
+            config["access"] = verifier
+        return config
+
+    def node_summary(self, node_id: str) -> Dict[str, Any]:
+        """What the locked `status` view on a device shows about itself."""
+        detail = self.registry.node_detail(node_id) or {}
+        stats = self.queue.node_stats(node_id)
+        leased = self.registry._conn.execute(
+            "SELECT COUNT(*) AS n FROM tasks WHERE leased_to=? AND status='leased'", (node_id,)
+        ).fetchone()
+        rank = next((s["rank"] for s in self.holo.successors() if s["node_id"] == node_id), None)
+        return {
+            "ok": bool(detail),
+            "node_id": node_id,
+            "hostname": detail.get("hostname"),
+            "last_seen": detail.get("last_seen"),
+            "tier": stats.get("tier"),
+            "completions": stats.get("completions"),
+            "failures": stats.get("failures"),
+            "working_on": leased["n"] if leased else 0,
+            "services": self.inference.desired_for(node_id),
+            "successor_rank": rank,
+            "epoch": self.holo.epoch,
+            "classes": self.queue.node_device_classes(node_id),
+        }
 
     def bundle_for(self, config: Optional[Dict[str, Any]] = None) -> bytes:
         """The agent file, with a per-invite config baked in. Built from the

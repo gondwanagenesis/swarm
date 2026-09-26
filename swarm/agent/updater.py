@@ -109,10 +109,12 @@ def check_for_update(
     return data
 
 
-def download_and_verify(hub_url: str, expect_sha: str, timeout: float = 60.0) -> Optional[bytes]:
+def download_and_verify(
+    hub_url: str, expect_sha: str, timeout: float = 60.0, headers: Optional[Dict[str, str]] = None
+) -> Optional[bytes]:
     url = hub_url.rstrip("/") + "/api/bundle/latest"
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers or {}), timeout=timeout) as resp:
             data = resp.read()
             header_sha = resp.headers.get("X-Bundle-SHA256")
     except Exception:
@@ -144,7 +146,7 @@ def apply_update(hub_url: str, headers: Optional[Dict[str, str]] = None, node_id
         return "current"
     if not remote_code and remote_sha == me_sha:
         return "current"
-    blob = download_and_verify(hub_url, remote_sha)
+    blob = download_and_verify(hub_url, remote_sha, headers=headers)
     if blob is None:
         return "hash-mismatch"
     blob = with_config(blob, _own_config())

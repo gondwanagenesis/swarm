@@ -150,6 +150,7 @@ class Sim:
                 "SWARM_FAILOVER_S": "8",
                 "SWARM_RANK_GRACE_S": "6",
                 "SWARM_REPLICA_REFRESH_S": "3",
+                "SWARM_REPLICA_MAX_AGE_S": "3",
                 "SWARM_ONLINE_WINDOW_S": "12",
                 "SWARM_ADVERTISE_ADDRESSES": "",
                 "SWARM_HUB_SECURE": "1",
@@ -370,7 +371,9 @@ class Sim:
         while time.time() < deadline and new_url is None:
             for s in succ:
                 try:
-                    with urllib.request.urlopen(s["url"] + "/api/hubinfo", timeout=1) as r:
+                    # a secure hub is dark to strangers: ask as the owner
+                    req = urllib.request.Request(s["url"] + "/api/hubinfo", headers={"Authorization": "Bearer " + self.owner.key})
+                    with urllib.request.urlopen(req, timeout=1) as r:
                         info = json.loads(r.read())
                     if info.get("epoch", 0) >= 2 and not info.get("demoted"):
                         new_url = s["url"]
@@ -461,22 +464,38 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--report", default=str(ROOT / "docs" / "SIMULATION.md"))
     ap.add_argument("--keep", action="store_true", help="keep the temp directory (logs) afterwards")
+    ap.add_argument("--only", default="", help="comma list of scenarios to run after S1, e.g. S9 or S3,S9")
     args = ap.parse_args(argv)
     work = Path(tempfile.mkdtemp(prefix="swarm-sim-"))
     print(f"simulation workdir: {work}")
     sim = Sim(work, find_llama_dir(), find_models_dir())
     print(f"llama.cpp: {sim.llama_dir or 'absent'}; models: {sim.models_dir or 'none'}")
+    only = {x.strip().upper() for x in args.only.split(",") if x.strip()}
+
+    def run(sid: str, fn, *a):
+        if only and sid not in only:
+            return None
+        t0 = time.time()
+        try:
+            return fn(*a)
+        except Exception as exc:  # a crashed scenario is a FAIL with its reason, never a missing row
+            import traceback
+
+            sim.record(sid, fn.__name__, "FAIL", f"crashed: {type(exc).__name__}: {exc} | "
+                       + traceback.format_exc(limit=3).strip().splitlines()[-2].strip(), time.time() - t0)
+            return None
+
     try:
         sim.start_hub()
         sim.s1_assemble()
-        sim.s2_map()
-        sim.s4_hot_phone()
-        sim.s3_chaos()
-        sim.s5_mcp()
-        sim.s6_embed()
-        gguf = sim.s7_pooled()
-        sim.s8_helper_dies(gguf)
-        sim.s9_hub_dies()
+        run("S2", sim.s2_map)
+        run("S4", sim.s4_hot_phone)
+        run("S3", sim.s3_chaos)
+        run("S5", sim.s5_mcp)
+        run("S6", sim.s6_embed)
+        gguf = run("S7", sim.s7_pooled)
+        run("S8", sim.s8_helper_dies, gguf)
+        run("S9", sim.s9_hub_dies)
     finally:
         sim.report(Path(args.report))
         sim.shutdown()

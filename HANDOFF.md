@@ -232,6 +232,18 @@ every agent file carries the hub.
 26. **`tarfile.extractall` without `filter="data"`** accepts `..` and absolute
     paths from a hostile archive. The joiner uses the filter where available.
 
+27. **A cache that is only rebuilt when fetched, and only fetched when it
+    changes, never changes.** The hub's advertised replica hash did exactly
+    that, so successors held a copy from before most nodes joined. Replicas now
+    rebuild on membership change (`holo.mark_dirty`) and every
+    `SWARM_REPLICA_MAX_AGE_S`. Nodes a replica still misses re-join with their invite.
+28. **Guard the heartbeat.** An exception in one iteration used to end the
+    thread silently — and with it liveness, succession and re-attachment. The
+    services loop also refreshes `last_seen`, which masked it.
+29. **Low profile ≠ disguise.** The hub answers strangers with a plain 404 and
+    devices use neutral names, but processes stay honestly `python`/`pythonw`
+    and files stay in the user's profile. Never impersonate system processes.
+
 ## Hard-hat areas (rough drafts — honest labels)
 
 - `swarm/hub/pipeline.py` — M5 *scaffold*. Stage→node mapping on measured free

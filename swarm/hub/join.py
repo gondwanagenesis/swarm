@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import html
 import time
-from typing import Any
+from typing import Any, Optional
 
 from ..agent.join_scripts import build_seed_kit, render_posix, render_powershell
 
@@ -71,13 +71,18 @@ def handle_join(hub: Any, handler: Any, path: str) -> None:
     q = handler._query()
     base = handler._public_base()
     if path == "/join":
-        _send_text(handler, join_page(hub, base, bool(q.get("dedicated") == "1")), "text/html; charset=utf-8")
+        presented = hub.auth.owner_key_from(handler.headers, q) or hub.auth.owner_key
+        _send_text(
+            handler, join_page(hub, base, bool(q.get("dedicated") == "1"), presented), "text/html; charset=utf-8"
+        )
         return
 
     token = str(q.get("token") or "")
     record = hub.enrollment.validate(token)
     if record is None:
-        _send_text(handler, "# invalid or expired invite token - ask the hub owner for a fresh /join link\n", status=403)
+        # dark: 404 like any other unknown path; the one comment line is for
+        # the owner who pasted a stale line, and says nothing about what this is
+        _send_text(handler, "# this link has expired - get a fresh one\n", status=404)
         return
     dedicated = q.get("dedicated") == "1"
     tag = fleet_llama_tag(hub)
@@ -86,7 +91,7 @@ def handle_join(hub: Any, handler: Any, path: str) -> None:
     elif path == "/join.ps1":
         _send_text(handler, render_powershell(base, token, dedicated, llama_tag=tag))
     elif path == "/join/seed-kit.zip":
-        bundle = hub.bundle_for({"hub": base, "token": token, "dedicated": dedicated})
+        bundle = hub.bundle_for(hub.bundle_config(base, token, dedicated=dedicated))
         expires = time.strftime("%Y-%m-%d", time.localtime(float(record["expires_at"])))
         data = build_seed_kit(base, token, bundle, expires, dedicated, llama_tag=tag)
         handler.send_response(200)
@@ -97,7 +102,18 @@ def handle_join(hub: Any, handler: Any, path: str) -> None:
         handler.wfile.write(data)
 
 
-def join_page(hub: Any, base: str, dedicated_default: bool = False) -> str:
+def access_block(code: str) -> str:
+    if not code:
+        return ""
+    return f"""<section><h2>Your device access code</h2>
+<p class="dim">Devices stay quiet: no windows, no output, a hidden folder. To look at one, run its status command
+in a terminal and type this code (devices store only a salted hash of it):</p>
+<pre>{html.escape(code)}</pre>
+<p class="dim">Windows: <code>python %USERPROFILE%\\.swarm\\swarm-agent.pyz status</code> &middot;
+Linux / macOS / Android: <code>python3 ~/.swarm/swarm-agent.pyz status</code></p></section>"""
+
+
+def join_page(hub: Any, base: str, dedicated_default: bool = False, owner_key: Optional[str] = None) -> str:
     tok = hub.enrollment.create(role="node", label="join-page", ttl_s=JOIN_TOKEN_TTL_S)["token"]
     kit = hub.enrollment.create(role="node", label="seed-kit", ttl_s=KIT_TOKEN_TTL_S)["token"]
     e = html.escape
@@ -111,6 +127,12 @@ def join_page(hub: Any, base: str, dedicated_default: bool = False) -> str:
         'powershell -NoProfile -ExecutionPolicy Bypass -Command '
         f'"irm \'{base}/join.ps1?token={tok}&dedicated=1\' | iex"'
     )
+    access = ""
+    if owner_key and hub.secure:
+        from .lowprofile import derive_access_code
+
+        hub.access_verifier()  # make sure devices get a verifier baked in
+        access = derive_access_code(owner_key)
     nodes = hub.registry.list_nodes()
     now = time.time()
     online = sum(1 for n in nodes if n.get("last_seen") and now - n["last_seen"] < 90)
@@ -134,6 +156,7 @@ a.btn{{display:inline-block;background:var(--acc);color:#0f1215;padding:9px 16px
 <p class="sub">{online} of {len(nodes)} known nodes online &middot; <a href="/" style="color:var(--acc)">dashboard</a> &middot;
 invite links expire in 7 days (seed kit: 30). Click a command to copy it.</p>
 
+{access_block(access)}
 <section><h2>Linux, macOS, Raspberry Pi</h2>
 <pre>{e(sh)}</pre>
 <p class="dim">Machine that exists only to compute (closet box, GPU rig)? Use the dedicated line - it keeps working while someone is logged in:</p>

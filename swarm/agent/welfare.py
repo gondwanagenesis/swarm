@@ -137,6 +137,13 @@ def welfare_gate(dedicated: bool = False) -> Dict[str, Any]:
         "dedicated": dedicated,
     }
 
+    import os
+    from pathlib import Path
+
+    home = Path(os.environ.get("USERPROFILE") or str(Path.home())) if os.name == "nt" else Path.home()
+    if (home / ".swarm" / "paused").exists():
+        return {"allowed": False, "reason": "paused by owner", "details": details}
+
     heat = thermal_state()
     details["thermal"] = heat
     if heat.get("battery_c") is not None and heat["battery_c"] >= BATTERY_HOT_C:

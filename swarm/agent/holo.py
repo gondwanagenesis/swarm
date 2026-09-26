@@ -144,17 +144,22 @@ def fetch_replica(state: HoloState, hub_url: str, headers: Dict[str, str]) -> bo
     return False
 
 
-def hub_info(url: str, timeout: float = 3.0) -> Optional[Dict[str, Any]]:
+def hub_info(url: str, timeout: float = 3.0, headers: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
+    """A hub's identity. Secure hubs answer only credentialed callers (a node
+    key works on any hub of the swarm: replicas carry every key's hash)."""
     try:
-        with urllib.request.urlopen(url.rstrip("/") + "/api/hubinfo", timeout=timeout) as resp:
+        req = urllib.request.Request(url.rstrip("/") + "/api/hubinfo", headers=headers or {})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             info = json.loads(resp.read().decode("utf-8"))
         return info if info.get("ok") else None
     except Exception:
         return None
 
 
-def serving(url: str, swarm_id: Optional[str], min_epoch: int) -> Optional[Dict[str, Any]]:
-    info = hub_info(url)
+def serving(
+    url: str, swarm_id: Optional[str], min_epoch: int, headers: Optional[Dict[str, str]] = None
+) -> Optional[Dict[str, Any]]:
+    info = hub_info(url, headers=headers)
     if info is None or info.get("demoted"):
         return None
     if swarm_id and info.get("swarm_id") != swarm_id:
@@ -164,7 +169,9 @@ def serving(url: str, swarm_id: Optional[str], min_epoch: int) -> Optional[Dict[
     return info
 
 
-def promote(state: HoloState, entry: Dict[str, Any]) -> Optional[subprocess.Popen]:
+def promote(
+    state: HoloState, entry: Dict[str, Any], headers: Optional[Dict[str, str]] = None
+) -> Optional[subprocess.Popen]:
     """Become the hub: restore the replica at epoch+1, start a hub process
     from this node's own agent file, bound where the old hub said we would
     serve. Returns the process, or None when there is nothing to restore."""
@@ -190,10 +197,12 @@ def promote(state: HoloState, entry: Dict[str, Any]) -> Optional[subprocess.Pope
     state.data["hub_url"] = entry["url"]
     state.data["promoted_at"] = time.time()
     state.save()
-    return launch_hub(state, entry, new_epoch)
+    return launch_hub(state, entry, new_epoch, headers)
 
 
-def launch_hub(state: HoloState, entry: Dict[str, Any], epoch: int) -> Optional[subprocess.Popen]:
+def launch_hub(
+    state: HoloState, entry: Dict[str, Any], epoch: int, headers: Optional[Dict[str, str]] = None
+) -> Optional[subprocess.Popen]:
     """Start (or restart) the hub process on this node's hub database.
     Detached: the hub belongs to the swarm and outlives this agent."""
     db = state.hub_db
@@ -222,7 +231,7 @@ def launch_hub(state: HoloState, entry: Dict[str, Any], epoch: int) -> Optional[
         log.close()
     deadline = time.time() + 30
     while time.time() < deadline:
-        if hub_info(entry["url"], timeout=1.0):
+        if hub_info(entry["url"], timeout=1.0, headers=headers):
             return proc
         if proc.poll() is not None:
             return None
@@ -230,7 +239,7 @@ def launch_hub(state: HoloState, entry: Dict[str, Any], epoch: int) -> Optional[
     return proc
 
 
-def choose_hub(state: HoloState, dead_for_s: float) -> Dict[str, Any]:
+def choose_hub(state: HoloState, dead_for_s: float, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """Decide what to do after the hub has been silent `dead_for_s` seconds.
 
     Returns {"action": "wait"} | {"action": "switch", "url"} |
@@ -240,7 +249,7 @@ def choose_hub(state: HoloState, dead_for_s: float) -> Dict[str, Any]:
     for s in successors:
         if s.get("node_id") == state.node_id:
             continue
-        if serving(s["url"], swarm_id, state.epoch):
+        if serving(s["url"], swarm_id, state.epoch, headers):
             return {"action": "switch", "url": s["url"]}
     rank = state.my_rank()
     if rank is None:

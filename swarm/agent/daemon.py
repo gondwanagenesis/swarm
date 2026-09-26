@@ -251,12 +251,14 @@ class Agent:
                     self.switch_hub(str(target))
                 return None
             if resp.status != 200:
-                if resp.status in (401, 403):
+                if resp.status in (401, 403) or (resp.status == 404 and path == "/api/register"):
                     try:
                         detail = json.loads(raw.decode("utf-8")).get("error")
                     except Exception:
-                        detail = raw[:200]
-                    print(f"agent: hub refused {path} ({resp.status}): {detail}", file=sys.stderr, flush=True)
+                        detail = None
+                    if resp.status == 404:
+                        detail = "not accepted (invite invalid or expired, or not this swarm's hub)"
+                    print(f"agent: hub refused {path} ({resp.status}): {detail or 'unauthorized'}", file=sys.stderr, flush=True)
                 return None
             return json.loads(raw.decode("utf-8"))
         except Exception:
@@ -383,6 +385,19 @@ class Agent:
             watcher = None
         try:
             while not self._stop.is_set():
+                try:
+                    self._heartbeat_once()
+                except Exception as exc:
+                    # The heartbeat is this node's lifeline (liveness, hub
+                    # succession, re-attachment). Nothing may kill it.
+                    print(f"[heartbeat] error, continuing: {type(exc).__name__}: {exc}", flush=True)
+                self._stop.wait(HEARTBEAT_SECONDS)
+        finally:
+            if watcher is not None:
+                watcher.stop()
+
+    def _heartbeat_once(self) -> None:
+        if True:
                 welfare = None
                 try:
                     from .welfare import battery_state, user_idle_seconds
@@ -404,10 +419,6 @@ class Agent:
                 else:
                     self._on_hub_silent()
                 self._supervise_local_hub()
-                self._stop.wait(HEARTBEAT_SECONDS)
-        finally:
-            if watcher is not None:
-                watcher.stop()
 
     # -- holographic hub: follow, replicate, fail over ---------------------------
 
@@ -426,6 +437,15 @@ class Agent:
         if self.node_id and self.node_key:
             return {"X-Swarm-Node": self.node_id, "X-Swarm-Node-Key": self.node_key}
         return {}
+
+    def _holo_headers(self) -> Dict[str, str]:
+        """Credentials for asking a (possibly new) hub who it is: the node
+        key, plus the original invite as a fallback for a replica that
+        predates this node."""
+        headers = self._node_headers()
+        if self.token:
+            headers["X-Swarm-Token"] = str(self.token)
+        return headers
 
     def _on_hub_alive(self, resp: Dict[str, Any]) -> None:
         self._hub_ok_at = time.time()
@@ -449,14 +469,22 @@ class Agent:
 
         if dead_for < failover_after_s():
             return
-        decision = choose_hub(state, dead_for)
+        decision = choose_hub(state, dead_for, self._holo_headers())
+        if decision["action"] == "wait" and time.time() - getattr(self, "_holo_logged_at", 0.0) > 30:
+            self._holo_logged_at = time.time()
+            rank = state.my_rank()
+            print(
+                f"[holo] hub silent {dead_for:.0f}s; no successor serving yet"
+                + (f"; this node is successor #{rank}, waiting its turn" if rank is not None else "; waiting"),
+                flush=True,
+            )
         if decision["action"] == "switch":
             print(f"[holo] hub silent {dead_for:.0f}s; following successor {decision['url']}", flush=True)
             self.switch_hub(decision["url"])
         elif decision["action"] == "promote":
             entry = decision["entry"]
             print(f"[holo] hub silent {dead_for:.0f}s; this node is successor #{entry.get('rank')} -- becoming the hub at {entry['url']}", flush=True)
-            proc = promote(state, entry)
+            proc = promote(state, entry, self._holo_headers())
             if proc is not None:
                 self._hub_proc = proc
                 self.switch_hub(entry["url"])
@@ -474,7 +502,7 @@ class Agent:
 
         print("[holo] the hub this node runs exited; restarting it on its own database", flush=True)
         entry = {"url": state.data.get("hub_url") or self.hub_url}
-        self._hub_proc = launch_hub(state, entry, state.epoch)
+        self._hub_proc = launch_hub(state, entry, state.epoch, self._holo_headers())
 
     def switch_hub(self, url: str) -> None:
         parsed = urlparse(url if "://" in url else "http://" + url)
@@ -831,6 +859,8 @@ def _redirect_output(path: str, max_bytes: int = 5 * 1024 * 1024) -> None:
         if target.exists() and target.stat().st_size > max_bytes:
             os.replace(target, target.with_suffix(target.suffix + ".1"))
         fh = open(target, "a", buffering=1, encoding="utf-8", errors="replace")  # noqa: SIM115 - lives as stdout
+        with contextlib.suppress(OSError):
+            os.chmod(target, 0o600)  # low profile: only the device's owner can read it
         sys.stdout = fh
         sys.stderr = fh
         print(f"--- agent start {time.strftime('%Y-%m-%d %H:%M:%S')} ---", flush=True)
@@ -848,8 +878,102 @@ def _can_run_hub() -> bool:
         return False
 
 
+LOCAL_COMMANDS = ("status", "pause", "resume", "leave")
+
+
+def local_control(command: str, code: Optional[str] = None) -> int:
+    """`status` / `pause` / `resume` / `leave` on THIS device, behind the
+    swarm's access code (lowprofile.py). The wrong code gets a bare "no"."""
+    from ..hub.lowprofile import check_code
+
+    cfg = bundled_config()
+    verifier = cfg.get("access")
+    if verifier:
+        if code is None:
+            code = os.environ.get("SWARM_ACCESS_CODE")
+        if code is None:
+            import getpass
+
+            try:
+                code = getpass.getpass("code: ")
+            except (EOFError, KeyboardInterrupt):
+                code = ""
+        if not check_code(code, verifier):
+            print("no")
+            return 1
+    state = _state_dir()
+    paused_flag = state / "paused"
+    if command == "pause":
+        state.mkdir(parents=True, exist_ok=True)
+        paused_flag.write_text(time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
+        print("paused: this device takes no new work until `resume`")
+        return 0
+    if command == "resume":
+        with contextlib.suppress(FileNotFoundError):
+            paused_flag.unlink()
+        print("resumed")
+        return 0
+    leave_file = state / "leave.txt"
+    if command == "leave":
+        text = leave_file.read_text(encoding="utf-8").strip() if leave_file.exists() else ""
+        print("to remove this device from the swarm, run:\n  " + (text or "(no leave line recorded; delete ~/.swarm)"))
+        return 0
+    # status
+    hub = cfg.get("hub") or "?"
+    holo_files = sorted(state.glob("holo-*.json"))
+    holo: Dict[str, Any] = {}
+    if holo_files:
+        with contextlib.suppress(Exception):
+            holo = json.loads(holo_files[-1].read_text(encoding="utf-8"))
+    hub = holo.get("hub_url") or hub
+    node_id = ""
+    with contextlib.suppress(Exception):
+        node_id = (state / "node_id").read_text(encoding="utf-8").split()[0]
+    keys: Dict[str, str] = {}
+    with contextlib.suppress(Exception):
+        keys = json.loads((state / "node_keys.json").read_text(encoding="utf-8"))
+    key = next((v for k, v in keys.items() if k.endswith("|" + node_id)), None)
+    summary: Dict[str, Any] = {}
+    if key and hub != "?":
+        with contextlib.suppress(Exception):
+            import urllib.request
+
+            req = urllib.request.Request(
+                hub.rstrip("/") + "/api/me", headers={"X-Swarm-Node": node_id, "X-Swarm-Node-Key": key}
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                summary = json.loads(resp.read().decode("utf-8"))
+    from .welfare import welfare_gate
+
+    gate = welfare_gate()
+    lines = [
+        "swarm node",
+        f"  node      {node_id or '?'}",
+        f"  hub       {hub}  (epoch {holo.get('epoch', '?')})",
+        f"  state     {'PAUSED by owner' if paused_flag.exists() else ('working' if gate['allowed'] else 'resting: ' + gate['reason'])}",
+    ]
+    if summary.get("ok"):
+        lines += [
+            f"  hub says  tier {summary.get('tier')}, {summary.get('completions') or 0} tasks done, "
+            f"{summary.get('working_on') or 0} in hand, {len(summary.get('services') or [])} service(s)",
+            f"  successor {'#' + str(summary['successor_rank']) if summary.get('successor_rank') is not None else 'no'}",
+        ]
+    else:
+        lines.append("  hub says  (unreachable right now)")
+    log = state / "agent.log"
+    if log.exists():
+        with contextlib.suppress(Exception):
+            tail = log.read_text(encoding="utf-8", errors="replace").splitlines()[-5:]
+            lines.append("  recent    " + "\n            ".join(tail))
+    lines.append("  commands  status | pause | resume | leave   (each asks for the code)")
+    print("\n".join(lines))
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
+    if raw and raw[0] in LOCAL_COMMANDS:
+        return local_control(raw[0])
     if "--run-hub" in raw:
         # The agent file carries the whole swarm: this runs a hub from it
         # (holographic failover, or a phone chosen to coordinate).

@@ -227,23 +227,23 @@ STARTED=0
 if [ "$AUTOSTART" = 1 ]; then
   if [ "$IS_TERMUX" = 1 ]; then
     mkdir -p "$HOME/.termux/boot"
-    cat > "$HOME/.termux/boot/swarm-agent" <<EOF
+    cat > "$HOME/.termux/boot/compute-node" <<EOF
 #!/data/data/com.termux/files/usr/bin/sh
 termux-wake-lock 2>/dev/null
 # watchdog: if the agent ever dies, it is back in 10 s (its lock prevents doubles)
 nohup sh -c 'while true; do "$PY" "$AGENT" $ARGS; sleep 10; done' >/dev/null 2>&1 &
 EOF
-    chmod +x "$HOME/.termux/boot/swarm-agent"
+    chmod +x "$HOME/.termux/boot/compute-node"
     echo "autostart: Termux:Boot script installed (install the Termux:Boot app once, open it once)"
-    UNINSTALL="rm -f ~/.termux/boot/swarm-agent; pkill -f '[s]warm-agent.pyz'; rm -rf ~/.swarm/swarm-agent.pyz ~/.swarm/node_keys.json ~/.swarm/agent.log* ~/.swarm/agent*.lock ~/.swarm/node_id ~/.swarm/holo-*.json ~/.swarm/replica ~/.swarm/hub-* ~/.swarm/hub-promoted.log ~/.swarm/llama ~/.swarm/logs"
+    UNINSTALL="rm -f ~/.termux/boot/compute-node; pkill -f '[s]warm-agent.pyz'; rm -rf ~/.swarm/swarm-agent.pyz ~/.swarm/node_keys.json ~/.swarm/agent.log* ~/.swarm/agent*.lock ~/.swarm/node_id ~/.swarm/holo-*.json ~/.swarm/replica ~/.swarm/hub-* ~/.swarm/hub-promoted.log ~/.swarm/llama ~/.swarm/logs"
   elif [ "$(uname)" = "Darwin" ]; then
-    PLIST="$HOME/Library/LaunchAgents/net.swarm.agent.plist"
+    PLIST="$HOME/Library/LaunchAgents/local.compute-node.plist"
     mkdir -p "$HOME/Library/LaunchAgents"
     cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>Label</key><string>net.swarm.agent</string>
+  <key>Label</key><string>local.compute-node</string>
   <key>ProgramArguments</key><array>
     <string>$PY</string><string>$AGENT</string><string>--work</string><string>--self-update</string><string>--log</string><string>$DIR/agent.log</string>
   </array>
@@ -257,7 +257,7 @@ EOF
   elif command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
     UNIT_DIR="$HOME/.config/systemd/user"
     mkdir -p "$UNIT_DIR"
-    cat > "$UNIT_DIR/swarm-agent.service" <<EOF
+    cat > "$UNIT_DIR/compute-node.service" <<EOF
 [Unit]
 Description=Swarm agent (compute node)
 After=network-online.target
@@ -272,16 +272,19 @@ Nice=10
 WantedBy=default.target
 EOF
     systemctl --user daemon-reload
-    systemctl --user enable --now swarm-agent.service && STARTED=1
+    systemctl --user enable --now compute-node.service && STARTED=1
     echo "autostart: systemd --user unit installed"
     echo "  (to keep it running while you are logged out: sudo loginctl enable-linger $USER)"
-    UNINSTALL="systemctl --user disable --now swarm-agent; rm -f $UNIT_DIR/swarm-agent.service; rm -rf ~/.swarm/swarm-agent.pyz ~/.swarm/node_keys.json ~/.swarm/agent.log* ~/.swarm/agent*.lock ~/.swarm/node_id ~/.swarm/holo-*.json ~/.swarm/replica ~/.swarm/hub-* ~/.swarm/hub-promoted.log ~/.swarm/llama ~/.swarm/logs"
+    UNINSTALL="systemctl --user disable --now compute-node; rm -f $UNIT_DIR/compute-node.service; rm -rf ~/.swarm/swarm-agent.pyz ~/.swarm/node_keys.json ~/.swarm/agent.log* ~/.swarm/agent*.lock ~/.swarm/node_id ~/.swarm/holo-*.json ~/.swarm/replica ~/.swarm/hub-* ~/.swarm/hub-promoted.log ~/.swarm/llama ~/.swarm/logs"
   elif command -v crontab >/dev/null 2>&1; then
     ( crontab -l 2>/dev/null | grep -v swarm-agent.pyz; echo "@reboot sh -c 'while true; do $PY $AGENT $ARGS; sleep 10; done'" ) | crontab -
     echo "autostart: crontab @reboot entry installed"
     UNINSTALL="crontab -l | grep -v swarm-agent.pyz | crontab -; pkill -f '[s]warm-agent.pyz'; rm -rf ~/.swarm/swarm-agent.pyz ~/.swarm/node_keys.json ~/.swarm/agent.log* ~/.swarm/agent*.lock ~/.swarm/node_id ~/.swarm/holo-*.json ~/.swarm/replica ~/.swarm/hub-* ~/.swarm/hub-promoted.log ~/.swarm/llama ~/.swarm/logs"
   fi
 fi
+# earlier installs used louder names; retire them
+systemctl --user disable --now swarm-agent 2>/dev/null || true
+rm -f "$HOME/.config/systemd/user/swarm-agent.service" "$HOME/.termux/boot/swarm-agent" 2>/dev/null || true
 [ -z "$UNINSTALL" ] && UNINSTALL="pkill -f '[s]warm-agent.pyz'; rm -rf ~/.swarm/swarm-agent.pyz ~/.swarm/node_keys.json ~/.swarm/agent.log* ~/.swarm/agent*.lock ~/.swarm/node_id ~/.swarm/holo-*.json ~/.swarm/replica ~/.swarm/hub-* ~/.swarm/hub-promoted.log ~/.swarm/llama ~/.swarm/logs"
 
 if [ "$STARTED" != 1 ]; then
@@ -289,8 +292,10 @@ if [ "$STARTED" != 1 ]; then
   # watchdog loop: a crash costs 10 s, not the node (the agent's lock prevents doubles)
   nohup sh -c "while true; do \"$PY\" \"$AGENT\" $ARGS; sleep 10; done" >/dev/null 2>&1 &
 fi
+printf '%s\n' "$UNINSTALL" > "$DIR/leave.txt"; chmod 600 "$DIR/leave.txt" 2>/dev/null
 echo ""
 echo "joined: this device is now a swarm node (log: $DIR/agent.log)"
+echo "it stays quiet. To look at it later: python3 $AGENT status   (asks for your access code)"
 echo "to leave the swarm: $UNINSTALL"
 '''
 
@@ -319,6 +324,8 @@ Write-Host 'It runs in userspace only and backs off while you use the PC (unless
 Write-Host ''
 $Dir = Join-Path $env:USERPROFILE '.swarm'
 New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+# low profile: the folder is hidden like other app config folders
+try { (Get-Item $Dir -Force).Attributes = (Get-Item $Dir -Force).Attributes -bor [IO.FileAttributes]::Hidden } catch { }
 $Here = if ($PSScriptRoot) { $PSScriptRoot } else { '' }
 
 $py = $null
@@ -390,12 +397,12 @@ if ($env:SWARM_CODE_WORKER -eq '1') { $AgentArgs = "$AgentArgs --code-worker" }
 
 # stop an earlier copy (and its watchdog) so the new one owns the node
 Get-CimInstance Win32_Process -Filter "Name like 'wscript%' or Name like 'python%'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -like '*swarm-agent.*' } |
+    Where-Object { $_.CommandLine -like '*swarm-agent.*' -or $_.CommandLine -like '*compute-node.vbs*' } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
 # A VBS shim runs it with no window; HKCU\Run starts it at logon. (Task
 # Scheduler mangles nested quotes on Win11, so it is deliberately not used.)
-$Vbs = Join-Path $Dir 'swarm-agent.vbs'
+$Vbs = Join-Path $Dir 'compute-node.vbs'
 $cmd = """$pyw"" ""$Agent"" $AgentArgs"
 # Watchdog: run hidden, wait for exit, restart after 10 s. The agent holds a
 # single-instance lock, so a restart racing a self-update exits harmlessly.
@@ -408,14 +415,18 @@ $vbsLines = @(
 )
 Set-Content -Path $Vbs -Value $vbsLines -Encoding ASCII
 if ($Autostart -ne '0') {
-    New-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'SwarmAgent' `
+    New-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'ComputeNode' `
         -Value "wscript.exe ""$Vbs""" -PropertyType String -Force | Out-Null
     Write-Host 'autostart: starts at logon (HKCU Run)'
 }
+# earlier installs used a louder name; retire it
+Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'SwarmAgent' -ErrorAction SilentlyContinue
 Start-Process -FilePath 'wscript.exe' -ArgumentList """$Vbs"""
 Write-Host ''
 Write-Host "joined: this PC is now a swarm node (log: $Log)"
-Write-Host "to leave the swarm: Remove-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run SwarmAgent; Get-CimInstance Win32_Process | ? CommandLine -like '*swarm-agent.*' | % { Stop-Process -Id `$_.ProcessId }; Remove-Item -Recurse -Force `"$Dir\swarm-agent.*`", `"$Dir\node_keys.json`", `"$Dir\agent.log*`", `"$Dir\agent*.lock`", `"$Dir\node_id`", `"$Dir\holo-*.json`", `"$Dir\replica`", `"$Dir\hub-*`", `"$Dir\llama`", `"$Dir\logs`" -ErrorAction SilentlyContinue"
+Write-Host "it stays quiet. To look at it later: python ""$Agent"" status   (asks for your access code)"
+Write-Host "to leave the swarm: Remove-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run ComputeNode; Get-CimInstance Win32_Process | ? { `$_.CommandLine -like '*swarm-agent.pyz*' -or `$_.CommandLine -like '*compute-node.vbs*' } | % { Stop-Process -Id `$_.ProcessId }; Remove-Item -Recurse -Force `"$Dir\swarm-agent.*`", `"$Dir\node_keys.json`", `"$Dir\agent.log*`", `"$Dir\agent*.lock`", `"$Dir\node_id`", `"$Dir\holo-*.json`", `"$Dir\replica`", `"$Dir\hub-*`", `"$Dir\llama`", `"$Dir\logs`" -ErrorAction SilentlyContinue"
+Set-Content -Path (Join-Path $Dir 'leave.txt') -Value "Remove-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run ComputeNode; Get-CimInstance Win32_Process | ? { `$_.CommandLine -like '*swarm-agent.pyz*' -or `$_.CommandLine -like '*compute-node.vbs*' } | % { Stop-Process -Id `$_.ProcessId }; Remove-Item -Recurse -Force `"$Dir\swarm-agent.*`", `"$Dir\node_keys.json`", `"$Dir\agent.log*`", `"$Dir\agent*.lock`", `"$Dir\node_id`", `"$Dir\holo-*.json`", `"$Dir\replica`", `"$Dir\hub-*`", `"$Dir\llama`", `"$Dir\logs`" -ErrorAction SilentlyContinue" -Encoding UTF8
 '''
 
 WINDOWS_CMD_TEMPLATE = r'''@echo off

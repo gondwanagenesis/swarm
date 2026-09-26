@@ -63,15 +63,15 @@ def test_owner_routes_need_the_owner_key(secure_hub):
     hub, port = secure_hub
     bag = {"op": "primesum", "params_list": [{"n": 10}]}
     code, _ = _call(port, "/api/bag/submit", bag)
-    assert code == 401
+    assert code == 404, "dark: a stranger cannot even tell the route exists"
     code, _ = _call(port, "/api/bag/submit", bag, {"Authorization": "Bearer wrong"})
-    assert code == 401
+    assert code == 404
     code, body = _call(port, "/api/bag/submit", bag, {"Authorization": f"Bearer {OWNER}"})
     assert code == 200 and body["ok"]
     # reading anything about the fleet is owner-only too
-    assert _call(port, "/api/nodes")[0] == 401
-    assert _call(port, "/api/tokens")[0] == 401
-    assert _call(port, "/api/backup")[0] == 401
+    assert _call(port, "/api/nodes")[0] == 404
+    assert _call(port, "/api/tokens")[0] == 404
+    assert _call(port, "/api/backup")[0] == 404
     assert _call(port, "/api/nodes", headers={"X-Swarm-Key": OWNER})[0] == 200
     # liveness stays public so agents can measure the link before joining
     assert _call(port, "/api/ping")[0] == 200
@@ -80,16 +80,16 @@ def test_owner_routes_need_the_owner_key(secure_hub):
 def test_code_carrying_bags_and_self_edits_are_locked_to_strangers(secure_hub):
     _, port = secure_hub
     evil = {"op": "x", "params_list": [{"adapter_source": "import os\ndef run(p): os.system('boom')"}]}
-    assert _call(port, "/api/bag/submit", evil)[0] == 401
+    assert _call(port, "/api/bag/submit", evil)[0] == 404
     patch = {"title": "t", "reason": "r", "files": {"swarm/__init__.py": "pwned"}}
-    assert _call(port, "/api/workshop/propose", patch)[0] == 401
-    assert _call(port, "/api/brain/admin", {"action": "enable"})[0] == 401
+    assert _call(port, "/api/workshop/propose", patch)[0] == 404
+    assert _call(port, "/api/brain/admin", {"action": "enable"})[0] == 404
 
 
 def test_join_needs_a_token_then_the_node_key_takes_over(secure_hub):
     hub, port = secure_hub
     code, body = _call(port, "/api/register", _profile("n1"))
-    assert code == 403
+    assert code == 404, "dark: without an invite the join endpoint looks like nothing"
 
     token = hub.enrollment.create()["token"]
     payload = dict(_profile("n1"), token=token)
@@ -133,7 +133,7 @@ def test_revoked_node_is_out(secure_hub):
 def test_invite_page_never_mints_tokens_for_strangers(secure_hub):
     hub, port = secure_hub
     code, _ = _call(port, "/invite")
-    assert code == 403
+    assert code == 404
     assert hub.enrollment.list_tokens() == []
     token = hub.enrollment.create()["token"]
     code, page = _call(port, f"/invite/{token}")
@@ -142,7 +142,7 @@ def test_invite_page_never_mints_tokens_for_strangers(secure_hub):
 
 def test_dashboard_key_visit_sets_cookie(secure_hub):
     _, port = secure_hub
-    assert _call(port, "/")[0] == 401
+    assert _call(port, "/")[0] == 404
     import http.client
 
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)

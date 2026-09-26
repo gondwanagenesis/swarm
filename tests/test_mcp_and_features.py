@@ -8,6 +8,7 @@ import hmac
 import io
 import json
 import threading
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -108,8 +109,12 @@ def test_worker_page_is_served():
     hub = Hub(host="127.0.0.1", port=0, secure=True, owner_key="swo_k")
     _, port = hub.start_background()
     try:
-        page = urllib.request.urlopen(f"http://127.0.0.1:{port}/worker", timeout=10).read().decode()
+        token = hub.enrollment.create()["token"]
+        page = urllib.request.urlopen(f"http://127.0.0.1:{port}/worker?token={token}", timeout=10).read().decode()
         assert "Start contributing" in page and '"primesum", "hashwork", "matmul"' in page
+        with pytest.raises(urllib.error.HTTPError) as err:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/worker", timeout=10)
+        assert err.value.code == 404, "no invite, no page: the worker page does not advertise the swarm"
     finally:
         hub.stop()
 

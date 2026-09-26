@@ -44,6 +44,15 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 SUCCESSOR_COUNT = 3
+
+
+def replica_max_age_s() -> float:
+    import os
+
+    try:
+        return float(os.environ.get("SWARM_REPLICA_MAX_AGE_S", "30"))
+    except ValueError:
+        return 30.0
 REPLICA_RESULT_TTL_S = 3 * 86400.0
 PEER_CHECK_S = 60.0
 DEFAULT_HUB_PORT = 8777
@@ -155,7 +164,16 @@ class Holo:
         self.settings.set(f"node_extra:{node_id}", json.dumps(extra, sort_keys=True))
 
     def info(self) -> Dict[str, Any]:
-        replica = self._replica_cache or {}
+        # The advertised replica must track the hub's memory. Rebuilt lazily
+        # (at most every REPLICA_MAX_AGE_S, or at once after a node joins):
+        # a successor holding a stale copy could promote into a hub that does
+        # not know the keys of nodes that joined since, and they could never
+        # re-attach. (Found by the fleet simulation.)
+        replica: Dict[str, Any] = {}
+        try:
+            replica = self.replica(max_age_s=replica_max_age_s())
+        except Exception:
+            replica = self._replica_cache or {}
         return {
             "swarm_id": self.swarm_id,
             "epoch": self.epoch,
@@ -172,6 +190,12 @@ class Holo:
         return int(self.settings.get("promoted_rank") or -1)
 
     # -- replica --------------------------------------------------------------
+
+    def mark_dirty(self) -> None:
+        """Membership changed (a node joined, a key was issued): the next
+        info() rebuilds the replica instead of advertising a stale one."""
+        with self._replica_lock:
+            self._replica_cache = None
 
     def replica(self, max_age_s: float = 30.0) -> Dict[str, Any]:
         """A consistent, pruned, gzipped snapshot. Rebuilt at most every
@@ -213,9 +237,16 @@ class Holo:
         """Ask each published successor whether it is running a NEWER hub of
         this swarm. If so, demote: this hub stops handing out work and
         redirects every caller."""
+        headers = {}
+        key_hash = getattr(getattr(self.hub, "auth", None), "owner_key_hash", None)
+        if key_hash:
+            from .lowprofile import peer_header
+
+            headers["X-Swarm-Peer"] = peer_header(key_hash)
         for s in self.successors() + json.loads(self.settings.get("last_successors") or "[]"):
             try:
-                with urllib.request.urlopen(s["url"] + "/api/hubinfo", timeout=3.0) as resp:
+                req = urllib.request.Request(s["url"] + "/api/hubinfo", headers=headers)
+                with urllib.request.urlopen(req, timeout=3.0) as resp:
                     info = json.loads(resp.read().decode("utf-8"))
             except Exception:
                 continue
