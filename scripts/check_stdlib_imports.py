@@ -88,6 +88,7 @@ BASELINE = {
     "bisect",
     "codecs",
     "fcntl",
+    "getpass",
     "gzip",
     "heapq",
     "hmac",
